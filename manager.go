@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -105,11 +106,11 @@ func (w *WorkerManager) Start() {
 
 	// Атомарно устанавливаем флаг запуска
 	if !w.starting.CompareAndSwap(false, true) {
-		w.Logger.Info("WorkerManager already in starting state", slog.String("op", op))
+		w.Logger.Info("Worker manager already in starting state", slog.String("op", op))
 		return
 	}
 
-	w.Logger.Info("Starting Worker manager", slog.String("op", op))
+	w.Logger.Info("Starting worker manager", slog.String("op", op))
 
 	if err := w.initTenantLimits(); err != nil {
 		w.Logger.Error("Failed to initialize tenant limits, using defaults",
@@ -201,7 +202,6 @@ func (w *WorkerManager) Stop() {
 		w.Logger.Info("Worker manager already in stopping state", slog.String("op", op))
 		return
 	}
-
 	w.Logger.Info("Starting worker manager shutdown", slog.String("op", op))
 
 	// Закрываем канал остановки (для taskScheduler)
@@ -245,7 +245,7 @@ func (w *WorkerManager) Stop() {
 	case <-done:
 		w.Logger.Info("All tasks completed successfully", slog.String("op", op))
 	case <-time.After(w.Config.GracefulTimeout):
-		w.Logger.Warn("Shutdown timed out - canceling remaining tasks", slog.String("op", op))
+		w.Logger.Warn("Shutdown timed out, canceling remaining tasks", slog.String("op", op))
 	}
 
 	// Очищаем все структуры данных
@@ -300,7 +300,7 @@ func (w *WorkerManager) RegisterScheduledTask(exec taskExecutor, interval time.D
 
 	// jitter первого запуска
 	jitter := backoff.CalculateExponentialBackoff(
-		1,
+		rand.Intn(10)+1,
 		w.Config.RetryPolicy.Jitter.MinDelay,
 		w.Config.RetryPolicy.Jitter.MaxDelay,
 	)
