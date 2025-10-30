@@ -1,0 +1,6 @@
+github.com/alfzs/backoff v1.0.2 h1:ZXVGX1ha/W9Q2bOYX7sR19WHC15d/hWV7dk4yqi8ck8=
+github.com/alfzs/backoff v1.0.2/go.mod h1:D99CHVK2uEJ5A1BcdQpOPmH5GidOX4Gy43i6SBqsu2o=
+github.com/alfzs/tracing v1.0.0 h1:6ITYFNCgzE6dgiNcTlhnQ5FNUdx8sTs5RZ+jWXWmkqs=
+github.com/alfzs/tracing v1.0.0/go.mod h1:r39q8peWHOdXEE4IYEOQTKsabw3QZIZy9r9DQXsjMhU=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
