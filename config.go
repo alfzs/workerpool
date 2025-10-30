@@ -2,6 +2,7 @@ package workerpool
 
 import "time"
 
+// config workerpool
 type Config struct {
 	TaskQueueSize   int           `yaml:"task_queue_size" env-default:"100"`
 	GracefulTimeout time.Duration `yaml:"graceful_timeout" env-default:"5m"`
