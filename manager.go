@@ -198,7 +198,7 @@ func (w *WorkerManager) Stop() {
 
 	// Атомарно устанавливаем флаг остановки
 	if !w.stopping.CompareAndSwap(false, true) {
-		w.Logger.Info("WorkerManager already in stopping state", slog.String("op", op))
+		w.Logger.Info("Worker manager already in stopping state", slog.String("op", op))
 		return
 	}
 
@@ -250,7 +250,7 @@ func (w *WorkerManager) Stop() {
 
 	// Очищаем все структуры данных
 	w.cleanupResources()
-	w.Logger.Info("WorkerManager fully stopped", slog.String("op", op))
+	w.Logger.Info("Worker manager fully stopped", slog.String("op", op))
 }
 
 func (w *WorkerManager) cleanupResources() {
