@@ -5,7 +5,6 @@ import "time"
 type Config struct {
 	TaskQueueSize   int           `yaml:"task_queue_size" env-default:"100"`
 	GracefulTimeout time.Duration `yaml:"graceful_timeout" env-default:"5m"`
-	WorkerLimit     WorkerLimit   `yaml:"worker_limit"`
 	RetryPolicy     RetryPolicy   `yaml:"retry_policy"`
 	Size            Size          `yaml:"worker_pool_size"`
 	Interval        Interval      `yaml:"interval"`
@@ -42,8 +41,4 @@ type Attempts struct {
 	Count    int           `yaml:"count" env-default:"3"`
 	MinDelay time.Duration `yaml:"min_delay" env-default:"1s"`
 	MaxDelay time.Duration `yaml:"max_delay" env-default:"5s"`
-}
-
-type WorkerLimit struct {
-	Event int `yaml:"event" env-default:"0"`
 }
