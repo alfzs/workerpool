@@ -17,8 +17,6 @@ type Interval struct {
 	Frequent  time.Duration `yaml:"frequent" env-default:"150s"`
 	Normal    time.Duration `yaml:"normal" env-default:"1h"`
 	Rate      time.Duration `yaml:"rate" env-default:"24h"`
-	// специальные интервалы
-	MsgDelivery time.Duration `yaml:"msg_delivery" env-default:"60s"`
 }
 
 type Size struct {
