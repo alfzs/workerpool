@@ -59,7 +59,19 @@ func (p *pool) start() {
 
 	for i := 0; i < p.workerCount; i++ {
 		p.wg.Add(1)
-		go p.worker(i)
+		workerID := i
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					p.logger.Error("Recovered from panic in worker goroutine",
+						slog.Any("panic", r),
+						slog.String("stack", string(debug.Stack())),
+						slog.Int("worker_id", workerID),
+						slog.String("op", op))
+				}
+			}()
+			p.worker(workerID)
+		}()
 	}
 }
 
@@ -112,17 +124,19 @@ func (p *pool) addTask(task Task) error {
 	}
 }
 
+// worker выполняет задачи из taskChan
 func (p *pool) worker(id int) {
 	op := "worker"
-
 	log := p.logger.With(
-		slog.String("trace_id", tracing.GetTraceID(p.ctx)), // INFO: trace_id уровня worker
-		slog.Int("worker_id", id))
+		slog.String("trace_id", tracing.GetTraceID(p.ctx)),
+		slog.Int("worker_id", id),
+	)
 
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error("Worker panic during shutdown",
+			log.Error("Recovered from panic inside worker",
 				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
 				slog.String("op", op))
 		}
 		log.Info("Worker stopped", slog.String("op", op))
@@ -132,9 +146,16 @@ func (p *pool) worker(id int) {
 	log.Info("Worker started", slog.String("op", op))
 
 	for task := range p.taskChan {
+		if p.stopping.Load() || p.ctx.Err() != nil {
+			log.Info("Stopping detected, breaking worker loop", slog.String("op", op))
+			break
+		}
+
 		taskLog := log.With(
 			slog.String("tenant_id", task.TenantID.String()),
-			slog.String("task_id", task.TaskID.String()))
+			slog.String("task_id", task.TaskID.String()),
+		)
+
 		p.runTask(task, id, taskLog)
 	}
 
