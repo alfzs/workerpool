@@ -42,6 +42,7 @@ type WorkerManager struct {
 	stopping        atomic.Bool
 }
 
+// WorkerManagerParams
 type WorkerManagerParams struct {
 	Ctx            context.Context
 	Logger         *slog.Logger
