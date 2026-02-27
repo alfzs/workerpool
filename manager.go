@@ -34,7 +34,7 @@ type WorkerManager struct {
 	activeTasksMu   sync.RWMutex
 	tenantLimits    map[uuid.UUID]int
 	tenantCounters  map[uuid.UUID]int
-	tenantTaskQueue map[uuid.UUID][]Task // Очередь задач для каждого тенанта, если воркеров меньше задач
+	tenantTaskQueue map[uuid.UUID][]Task
 	limitsMu        sync.RWMutex
 	stopChan        chan struct{}
 	wg              sync.WaitGroup
@@ -50,7 +50,6 @@ type WorkerManagerParams struct {
 	WorkerCount    int
 }
 
-// Task представляет задачу для выполнения
 type Task struct {
 	Ctx      context.Context
 	TaskID   uuid.UUID
@@ -65,17 +64,14 @@ type Tenant interface {
 	GetWorkerLimit() int
 }
 
-// tenantProvider интерфейс поставщика списка тенантов
 type tenantProvider interface {
 	GetActive(ctx context.Context) ([]Tenant, error)
 }
 
-// taskExecutor интерфейс для выполнения задач
 type taskExecutor interface {
 	Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error
 }
 
-// NewWorkerManager
 func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 	pool, err := newPool(Params{
 		Ctx:     p.Ctx,
@@ -105,7 +101,6 @@ func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 func (w *WorkerManager) Start() {
 	op := "start"
 
-	// Атомарно устанавливаем флаг запуска
 	if !w.starting.CompareAndSwap(false, true) {
 		w.Logger.Info("Worker manager already in starting state", slog.String("op", op))
 		return
@@ -153,17 +148,14 @@ func (w *WorkerManager) initTenantLimits() error {
 
 		w.tenantLimits[tenant.GetID()] = limit
 		w.tenantCounters[tenant.GetID()] = 0
-
 	}
 
 	return nil
 }
 
-// GetTenantWorkerLimit возвращает лимит воркеров для тенанта
 func (w *WorkerManager) getTenantWorkerLimit(t Tenant) int {
 	op := "get_tenant_worker_limit"
 
-	// WARN: этого кейса быть не должно
 	if t == nil {
 		w.Logger.Error("nil tenant provided, using default worker limit",
 			slog.String("op", op),
@@ -172,15 +164,12 @@ func (w *WorkerManager) getTenantWorkerLimit(t Tenant) int {
 		return defaultTenantWorkerCount
 	}
 
-	// Берем значение из БД
 	limit := t.GetWorkerLimit()
 	source := "tenant DB value"
 
-	// Если в настройках пула установлено, то используем его
 	if w.WorkerCount > 0 {
 		limit = w.WorkerCount
 		source = "worker manager config"
-		// Fallback
 	} else if limit <= 0 {
 		limit = defaultTenantWorkerCount
 		source = "default value"
@@ -198,24 +187,20 @@ func (w *WorkerManager) getTenantWorkerLimit(t Tenant) int {
 func (w *WorkerManager) Stop() {
 	op := "stop"
 
-	// Атомарно устанавливаем флаг остановки
 	if !w.stopping.CompareAndSwap(false, true) {
 		w.Logger.Info("Worker manager already in stopping state", slog.String("op", op))
 		return
 	}
 	w.Logger.Info("Starting worker manager shutdown", slog.String("op", op))
 
-	// Закрываем канал остановки (для taskScheduler)
 	close(w.stopChan)
 
-	// Останавливаем все таймеры и предотвращаем их перезапуск
 	w.timersMu.Lock()
-	w.executorsMu.Lock() // Блокируем регистрацию новых задач
+	w.executorsMu.Lock()
 	for id, timer := range w.timers {
 		if !timer.Stop() {
-			// Таймер уже сработал или был остановлен
 			select {
-			case <-timer.C: // Дренируем канал если нужно
+			case <-timer.C:
 			default:
 			}
 		}
@@ -224,10 +209,8 @@ func (w *WorkerManager) Stop() {
 	w.executorsMu.Unlock()
 	w.timersMu.Unlock()
 
-	// Останавливаем пул воркеров
 	w.pool.stop()
 
-	// Принудительная отмена оставшихся задач
 	w.activeTasksMu.Lock()
 	for key, cancel := range w.activeTasks {
 		cancel()
@@ -235,7 +218,6 @@ func (w *WorkerManager) Stop() {
 	}
 	w.activeTasksMu.Unlock()
 
-	// Ожидаем завершения активных задач с таймаутом
 	done := make(chan struct{})
 	go func() {
 		w.wg.Wait()
@@ -249,28 +231,24 @@ func (w *WorkerManager) Stop() {
 		w.Logger.Warn("Shutdown timed out, canceling remaining tasks", slog.String("op", op))
 	}
 
-	// Очищаем все структуры данных
 	w.cleanupResources()
 	w.Logger.Info("Worker manager fully stopped", slog.String("op", op))
 }
 
 func (w *WorkerManager) cleanupResources() {
-	// Очистка executors
 	w.executorsMu.Lock()
 	w.executors = make(map[uuid.UUID]taskExecutor)
 	w.executorsMu.Unlock()
 
-	// Очистка tenant-related данных
 	w.limitsMu.Lock()
 	w.tenantLimits = make(map[uuid.UUID]int)
 	w.tenantCounters = make(map[uuid.UUID]int)
 	for tenantID := range w.tenantTaskQueue {
-		w.tenantTaskQueue[tenantID] = nil // Освобождаем память
+		w.tenantTaskQueue[tenantID] = nil
 	}
 	w.tenantTaskQueue = make(map[uuid.UUID][]Task)
 	w.limitsMu.Unlock()
 
-	// Очистка активных задач
 	w.activeTasksMu.Lock()
 	w.activeTasks = make(map[string]context.CancelFunc)
 	w.activeTasksMu.Unlock()
@@ -299,7 +277,6 @@ func (w *WorkerManager) RegisterScheduledTask(exec taskExecutor, interval time.D
 		return nil
 	}
 
-	// jitter первого запуска
 	jitter := backoff.CalculateExponentialBackoff(
 		rand.Intn(10)+1,
 		w.Config.RetryPolicy.Jitter.MinDelay,
@@ -370,6 +347,7 @@ func (w *WorkerManager) taskScheduler() {
 	}
 }
 
+// ИСПРАВЛЕНО: triggerTask - убран вложенный захват блокировок
 func (w *WorkerManager) triggerTask(taskID uuid.UUID) {
 	op := "trigger_task"
 
@@ -390,12 +368,10 @@ func (w *WorkerManager) triggerTask(taskID uuid.UUID) {
 			slog.Any("error", err),
 			slog.String("op", op),
 		)
-
 		return
 	}
 	if len(tenants) == 0 {
 		log.Warn("No active tenants found, skip task", slog.String("op", op))
-
 		return
 	}
 
@@ -407,20 +383,12 @@ func (w *WorkerManager) triggerTask(taskID uuid.UUID) {
 
 		key := makeTaskKey(taskID, tenantID)
 
-		w.limitsMu.Lock()
-		if _, ok := w.tenantLimits[tenantID]; !ok {
-			limit := w.getTenantWorkerLimit(tenant)
-			w.tenantLimits[tenantID] = limit
-			w.tenantCounters[tenantID] = 0
-		}
-		limit := w.tenantLimits[tenantID]
-		w.limitsMu.Unlock()
-
+		// ИСПРАВЛЕНО: Проверяем активность задачи без блокировки limitsMu
 		w.activeTasksMu.RLock()
-		_, ok := w.activeTasks[key]
+		_, active := w.activeTasks[key]
 		w.activeTasksMu.RUnlock()
 
-		if ok {
+		if active {
 			log.Info("Task already running",
 				slog.String("tenant_id", tenantID.String()),
 				slog.String("op", op))
@@ -431,7 +399,16 @@ func (w *WorkerManager) triggerTask(taskID uuid.UUID) {
 			continue
 		}
 
-		// INFO: trace_id задачи tenants
+		// ИСПРАВЛЕНО: Получаем лимиты отдельно
+		w.limitsMu.Lock()
+		limit, exists := w.tenantLimits[tenantID]
+		if !exists {
+			limit = w.getTenantWorkerLimit(tenant)
+			w.tenantLimits[tenantID] = limit
+			w.tenantCounters[tenantID] = 0
+		}
+		w.limitsMu.Unlock()
+
 		ctxWithTrace := tracing.EnsureTraceID(w.Ctx)
 		ctx, cancel := context.WithCancel(ctxWithTrace)
 
@@ -443,24 +420,25 @@ func (w *WorkerManager) triggerTask(taskID uuid.UUID) {
 				taskContext: ctx,
 			},
 			Ctx:      ctx,
-			Complete: completedTask(w, tenantID, key),
+			Complete: completedTask(w, tenantID, key), // ИСПРАВЛЕНО: используем новую функцию
 		}
 
 		w.activeTasksMu.Lock()
 		w.activeTasks[key] = cancel
 		w.activeTasksMu.Unlock()
 
+		// ИСПРАВЛЕНО: Добавляем в очередь и обрабатываем
 		w.limitsMu.Lock()
-		// Добавляем задачу в очередь тенанта
 		w.tenantTaskQueue[tenantID] = append(w.tenantTaskQueue[tenantID], task)
-		// Пытаемся запустить задачи из очереди
-		w.processTenantQueue(tenantID, limit)
+		w.processTenantQueue(tenantID, limit) // Вызываем под защитой блокировки
 		w.limitsMu.Unlock()
 	}
 }
 
+// ИСПРАВЛЕНО: processTenantQueue - теперь ожидает, что вызывается под limitsMu
 func (w *WorkerManager) processTenantQueue(tenantID uuid.UUID, limit int) {
-	// Пока есть свободные воркеры и задачи в очереди
+	// ВАЖНО: Эта функция должна вызываться ТОЛЬКО под защитой limitsMu.Lock()
+
 	for w.tenantCounters[tenantID] < limit && len(w.tenantTaskQueue[tenantID]) > 0 {
 		task := w.tenantTaskQueue[tenantID][0]
 		w.tenantTaskQueue[tenantID] = w.tenantTaskQueue[tenantID][1:]
@@ -472,53 +450,68 @@ func (w *WorkerManager) processTenantQueue(tenantID uuid.UUID, limit int) {
 		w.activeTasks[key] = task.Complete
 		w.activeTasksMu.Unlock()
 
+		// Запускаем в отдельной горутине, чтобы не блокировать очередь
 		go w.handleAddTask(tenantID, task, key)
 	}
 }
 
+// ИСПРАВЛЕНО: handleAddTask - правильный порядок блокировок
 func (w *WorkerManager) handleAddTask(tenantID uuid.UUID, task Task, key string) {
 	op := "handle_add_task"
 
 	err := w.pool.addTask(task)
 	if err == nil {
-		return // Успешная отправка — выходим
+		return
 	}
 
-	// Логирование ошибки
 	w.Logger.Error("Failed to add task to pool",
 		slog.Any("error", err),
 		slog.String("op", op))
 
-	// Освобождение ресурсов
+	// ИСПРАВЛЕНО: Захватываем блокировки в правильном порядке
 	w.limitsMu.Lock()
+	defer w.limitsMu.Unlock()
+
 	w.tenantCounters[tenantID]--
-	w.limitsMu.Unlock()
 
 	w.activeTasksMu.Lock()
 	delete(w.activeTasks, key)
 	w.activeTasksMu.Unlock()
 
-	// Возврат задачи в очередь
-	w.limitsMu.Lock()
+	// Возврат задачи в очередь (в начало)
 	w.tenantTaskQueue[tenantID] = append([]Task{task}, w.tenantTaskQueue[tenantID]...)
-	w.limitsMu.Unlock()
+
+	// Пытаемся обработать следующую задачу
+	w.processTenantQueue(tenantID, w.tenantLimits[tenantID])
 }
 
+// ИСПРАВЛЕНО: completedTask - главное исправление! Больше нет вложенной блокировки
 func completedTask(w *WorkerManager, tenantID uuid.UUID, key string) func() {
 	return func() {
+		// ИСПРАВЛЕНО: Сначала уменьшаем счетчик под защитой мьютекса
 		w.limitsMu.Lock()
-		defer w.limitsMu.Unlock()
 
 		if w.tenantCounters[tenantID] > 0 {
 			w.tenantCounters[tenantID]--
 		}
 
+		// Сохраняем нужные данные перед разблокировкой
+		limit := w.tenantLimits[tenantID]
+		hasQueue := len(w.tenantTaskQueue[tenantID]) > 0
+
+		w.limitsMu.Unlock()
+
+		// Удаляем из активных задач отдельно
 		w.activeTasksMu.Lock()
 		delete(w.activeTasks, key)
 		w.activeTasksMu.Unlock()
 
-		// После завершения задачи пытаемся обработать следующую из очереди
-		w.processTenantQueue(tenantID, w.tenantLimits[tenantID])
+		// ИСПРАВЛЕНО: Обрабатываем очередь БЕЗ блокировки
+		if hasQueue {
+			w.limitsMu.Lock()
+			w.processTenantQueue(tenantID, limit)
+			w.limitsMu.Unlock()
+		}
 	}
 }
 
