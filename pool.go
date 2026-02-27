@@ -26,6 +26,7 @@ type pool struct {
 	stopping    atomic.Bool
 }
 
+// Params
 type Params struct {
 	Ctx     context.Context
 	Logger  *slog.Logger

@@ -75,6 +75,7 @@ type taskExecutor interface {
 	Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error
 }
 
+// NewWorkerManager
 func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 	pool, err := newPool(Params{
 		Ctx:     p.Ctx,
