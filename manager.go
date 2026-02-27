@@ -280,6 +280,10 @@ func (w *WorkerManager) RegisterScheduledTask(exec taskExecutor, interval time.D
 
 	log := w.Logger.With(slog.String("task_id", taskID.String()))
 
+	if w.stopping.Load() || w.Ctx.Err() != nil {
+		return nil // пул или менеджер остановлен
+	}
+
 	if exec == nil {
 		return fmt.Errorf("task executor is nil")
 	}
@@ -311,41 +315,42 @@ func (w *WorkerManager) RegisterScheduledTask(exec taskExecutor, interval time.D
 		slog.Duration("interval", interval),
 		slog.String("op", op))
 
-	var timerCallback func()
-	timerCallback = func() {
+	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Error("Recovered from panic in timer callback",
-					slog.Any("recover", r),
+				w.Logger.Error("Recovered from panic in scheduled task goroutine",
+					slog.Any("panic", r),
 					slog.String("stack", string(debug.Stack())),
-					slog.String("op", op))
+					slog.String("task_id", taskID.String()),
+					slog.String("op", "scheduled_task"))
 			}
 		}()
 
-		w.triggerTask(taskID)
+		// подождать initialDelay перед первым запуском
+		select {
+		case <-time.After(initialDelay):
+		case <-w.stopChan:
+			return
+		case <-w.Ctx.Done():
+			return
+		}
 
-		w.timersMu.Lock()
-		defer w.timersMu.Unlock()
-
-		if timer, ok := w.timers[taskID]; ok {
-			timer.Stop()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
 			select {
-			case <-timer.C:
-			default:
+			case <-ticker.C:
+				if w.stopping.Load() || w.Ctx.Err() != nil {
+					return
+				}
+				w.triggerTask(taskID)
+			case <-w.stopChan:
+				return
+			case <-w.Ctx.Done():
+				return
 			}
 		}
-		w.timers[taskID] = time.AfterFunc(interval, timerCallback)
-	}
-
-	w.executors[taskID] = exec
-
-	w.timersMu.Lock()
-	defer w.timersMu.Unlock()
-	if oldTimer, ok := w.timers[taskID]; ok {
-		oldTimer.Stop()
-	}
-
-	w.timers[taskID] = time.AfterFunc(initialDelay, timerCallback)
+	}()
 
 	return nil
 }
@@ -373,6 +378,10 @@ func (w *WorkerManager) triggerTask(taskID uuid.UUID) {
 	op := "trigger_task"
 
 	log := w.Logger.With(slog.String("task_id", taskID.String()))
+
+	if w.stopping.Load() || w.Ctx.Err() != nil {
+		return // пул или менеджер остановлен
+	}
 
 	w.executorsMu.RLock()
 	executor, ok := w.executors[taskID]
@@ -477,6 +486,12 @@ func (w *WorkerManager) processTenantQueue(tenantID uuid.UUID, limit int) {
 
 func (w *WorkerManager) handleAddTask(tenantID uuid.UUID, task Task, key string) {
 	op := "handle_add_task"
+
+	// пул или менеджер уже останавливается
+	if w.stopping.Load() {
+		w.Logger.Warn("Pool stopped, skipping task", slog.String("op", op))
+		return
+	}
 
 	err := w.pool.addTask(task)
 	if err == nil {
