@@ -2,42 +2,59 @@ package workerpool
 
 import "time"
 
-// config workerpool
+// Config holds all configuration parameters for the worker pool.
+// All fields have sensible defaults and can be overridden via YAML or environment variables.
 type Config struct {
-	TaskQueueSize   int           `yaml:"task_queue_size" env-default:"100"`
+	// TaskQueueSize is the capacity of the global task queue.
+	// If the queue is full, additional tasks will be rejected with an error.
+	TaskQueueSize int `yaml:"task_queue_size" env-default:"100"`
+
+	// GracefulTimeout is the maximum duration to wait for running tasks to complete
+	// during shutdown. After this timeout, remaining tasks are cancelled.
 	GracefulTimeout time.Duration `yaml:"graceful_timeout" env-default:"5m"`
-	RetryPolicy     RetryPolicy   `yaml:"retry_policy"`
-	Size            Size          `yaml:"worker_pool_size"`
-	Interval        Interval      `yaml:"interval"`
+
+	// TaskTimeout is the maximum execution time for a single task.
+	// Tasks exceeding this timeout are cancelled.
+	TaskTimeout time.Duration `yaml:"task_timeout" env-default:"5m"`
+
+	// RetryPolicy defines how failed tasks are retried.
+	RetryPolicy RetryPolicy `yaml:"retry_policy"`
+
+	// PoolSize defines the number of workers in the global pool for different priority levels.
+	PoolSize PoolSize `yaml:"pool_size"`
 }
 
-type Interval struct {
-	Fast      time.Duration `yaml:"fast" env-default:"30s"`
-	Immediate time.Duration `yaml:"immediate" env-default:"100s"`
-	Frequent  time.Duration `yaml:"frequent" env-default:"150s"`
-	Normal    time.Duration `yaml:"normal" env-default:"1h"`
-	Rate      time.Duration `yaml:"rate" env-default:"24h"`
-}
-
-type Size struct {
+// PoolSize defines worker counts for different pool configurations.
+// These can be used to prioritize different types of workloads.
+type PoolSize struct {
+	// Single worker pool - for sequential operations
 	Single int `yaml:"single" env-default:"1"`
-	Low    int `yaml:"low" env-default:"8"`
+
+	// Low priority pool - for background tasks
+	Low int `yaml:"low" env-default:"8"`
+
+	// Normal priority pool - for standard operations
 	Normal int `yaml:"normal" env-default:"32"`
-	Hight  int `yaml:"hight" env-default:"64"`
+
+	// High priority pool - for time-sensitive operations
+	High int `yaml:"high" env-default:"64"`
 }
 
+// RetryPolicy defines how task execution retries are handled.
 type RetryPolicy struct {
-	Jitter   Jitter
-	Attempts Attempts
+	// Attempts configures the retry behavior for failed tasks.
+	Attempts AttemptsConfig `yaml:"attempts"`
 }
 
-type Jitter struct {
-	MinDelay time.Duration `yaml:"min_delay" env-default:"5s"`
-	MaxDelay time.Duration `yaml:"max_delay" env-default:"10s"`
-}
+// AttemptsConfig defines the parameters for retry attempts.
+type AttemptsConfig struct {
+	// Count is the maximum number of execution attempts (including the first).
+	// If set to 3, a task will be tried up to 3 times before failing.
+	Count int `yaml:"count" env-default:"3"`
 
-type Attempts struct {
-	Count    int           `yaml:"count" env-default:"3"`
+	// MinDelay is the initial delay before the first retry.
 	MinDelay time.Duration `yaml:"min_delay" env-default:"1s"`
+
+	// MaxDelay is the maximum delay between retries (cap for exponential backoff).
 	MaxDelay time.Duration `yaml:"max_delay" env-default:"5s"`
 }
