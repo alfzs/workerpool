@@ -113,7 +113,7 @@ func (r *TaskRegistry) RegisterTask(
 	// Start scheduler for this task
 	r.startScheduler(task)
 
-	r.logger.Info("task registered",
+	r.logger.Info("Task registered",
 		slog.String("task_id", taskID.String()),
 		slog.String("name", name),
 		slog.Duration("interval", interval))
@@ -139,7 +139,7 @@ func (r *TaskRegistry) UnregisterTask(taskID uuid.UUID) error {
 
 	delete(r.tasks, taskID)
 
-	r.logger.Info("task unregistered",
+	r.logger.Info("Task unregistered",
 		slog.String("task_id", taskID.String()),
 		slog.String("name", task.Name))
 
@@ -155,7 +155,7 @@ func (r *TaskRegistry) startScheduler(task *TaskDefinition) {
 	go func() {
 		defer func() {
 			if rcv := recover(); rcv != nil {
-				r.logger.Error("scheduler panic",
+				r.logger.Error("Scheduler panic",
 					slog.String("task_id", task.ID.String()),
 					slog.String("name", task.Name),
 					slog.Any("panic", rcv))
@@ -165,7 +165,7 @@ func (r *TaskRegistry) startScheduler(task *TaskDefinition) {
 		// Add jitter before first execution if enabled
 		if task.JitterEnabled {
 			jitter := r.calculateJitter()
-			r.logger.Debug("adding jitter before first run",
+			r.logger.Debug("Adding jitter before first run",
 				slog.String("task_id", task.ID.String()),
 				slog.Duration("jitter", jitter))
 
@@ -196,7 +196,7 @@ func (r *TaskRegistry) executeForAllTenants(task *TaskDefinition) {
 	tenants := r.manager.GetActiveTenants()
 
 	if len(tenants) == 0 {
-		r.logger.Debug("no active tenants, skipping task execution",
+		r.logger.Debug("No active tenants, skipping task execution",
 			slog.String("task_id", task.ID.String()),
 			slog.String("name", task.Name))
 		return
@@ -217,7 +217,7 @@ func (r *TaskRegistry) executeForAllTenants(task *TaskDefinition) {
 		// Submit to tenant's queue
 		if err := r.manager.SubmitTask(tenantID, taskInstance); err != nil {
 			cancel() // Clean up if submission fails
-			r.logger.Warn("failed to submit scheduled task",
+			r.logger.Warn("Failed to submit scheduled task",
 				slog.String("task_id", task.ID.String()),
 				slog.String("name", task.Name),
 				slog.String("tenant_id", tenantID.String()),

@@ -141,7 +141,7 @@ func (w *WorkerManager) Stop() {
 		return
 	}
 
-	w.logger.Info("stopping worker manager")
+	w.logger.Info("Stopping worker manager")
 	w.cancel()
 
 	w.tenantsMu.Lock()
@@ -154,7 +154,7 @@ func (w *WorkerManager) Stop() {
 	w.wg.Wait()
 	w.pool.stop()
 
-	w.logger.Info("worker manager stopped")
+	w.logger.Info("Worker manager stopped")
 }
 
 // SubmitTask submits a task for execution by the specified tenant.
@@ -321,7 +321,7 @@ func (w *WorkerManager) executeTask(state *tenantState, workerID int, task Task)
 
 	// Submit to global pool
 	if err := w.pool.addTask(task); err != nil {
-		w.logger.Warn("failed to submit task to pool",
+		w.logger.Warn("Failed to submit task to pool",
 			slog.String("tenant_id", state.id.String()),
 			slog.Int("worker_id", workerID),
 			slog.Any("error", err))

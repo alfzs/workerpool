@@ -87,7 +87,7 @@ func (p *pool) start() {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					p.logger.Error("panic in worker",
+					p.logger.Error("Panic in worker",
 						slog.Any("panic", r),
 						slog.String("stack", string(debug.Stack())))
 				}
@@ -156,7 +156,7 @@ func (p *pool) worker(id int) {
 func (p *pool) runTask(task Task, workerID int) {
 	defer func() {
 		if r := recover(); r != nil {
-			p.logger.Error("panic in task",
+			p.logger.Error("Panic in task",
 				slog.Any("recover", r),
 				slog.String("stack", string(debug.Stack())))
 		}
@@ -204,7 +204,7 @@ func (p *pool) executeWithRetry(task Task, workerID int) {
 	}
 
 	// All retry attempts failed
-	p.logger.Error("task failed after retries",
+	p.logger.Error("Task failed after retries",
 		slog.String("tenant_id", task.TenantID.String()),
 		slog.Any("error", lastErr))
 }
