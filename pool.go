@@ -11,72 +11,104 @@ import (
 
 	"github.com/alfzs/backoff"
 	"github.com/alfzs/tracing"
+	"github.com/google/uuid"
 )
 
-// pool реализует workerpool
+// Task represents a unit of work to be executed by the worker pool.
+// It contains all necessary context and metadata for execution.
+type Task struct {
+	// Ctx is the context for this task, including timeout and cancellation.
+	Ctx context.Context
+
+	// TaskID uniquely identifies this task instance.
+	TaskID uuid.UUID
+
+	// TenantID identifies which tenant this task belongs to.
+	TenantID uuid.UUID
+
+	// Executor is the function that performs the actual work.
+	Executor taskExecutor
+
+	// Complete is an optional callback that is called after task execution
+	// (whether successful or failed). It is guaranteed to be called exactly once.
+	Complete func()
+}
+
+// pool is a fixed-size worker pool that executes tasks with retry logic.
+// It provides a global execution capacity shared across all tenants.
 type pool struct {
-	ctx         context.Context
-	logger      *slog.Logger
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	taskChan    chan Task
+	ctx    context.Context
+	cancel context.CancelFunc
+	logger *slog.Logger
+	config Config
+
+	// taskChan is the buffered channel for incoming tasks
+	taskChan chan Task
+
+	// workerCount is the number of concurrent workers
 	workerCount int
+
+	// maxAttempts is the number of retry attempts per task
 	maxAttempts int
-	config      Config
-	stopping    atomic.Bool
+
+	wg       sync.WaitGroup
+	stopping atomic.Bool
 }
 
-type Params struct {
-	Ctx     context.Context
-	Logger  *slog.Logger
-	Configs Config
+// PoolParams contains parameters for creating a new pool.
+type PoolParams struct {
+	Ctx    context.Context
+	Logger *slog.Logger
+	Config Config
 }
 
-// newPool создает новый workerpool
-func newPool(p Params) (*pool, error) {
+// newPool creates a new worker pool with the given configuration.
+// The pool is initially stopped; call Start() to begin processing.
+func newPool(p PoolParams) (*pool, error) {
 	ctx, cancel := context.WithCancel(p.Ctx)
 
 	return &pool{
 		ctx:         ctx,
 		cancel:      cancel,
 		logger:      p.Logger.With(slog.String("component", "worker_pool")),
-		config:      p.Configs,
-		workerCount: p.Configs.Size.Normal,
-		maxAttempts: p.Configs.RetryPolicy.Attempts.Count,
-		taskChan:    make(chan Task, p.Configs.TaskQueueSize),
+		config:      p.Config,
+		workerCount: p.Config.PoolSize.Normal,
+		maxAttempts: p.Config.RetryPolicy.Attempts.Count,
+		taskChan:    make(chan Task, p.Config.TaskQueueSize),
 	}, nil
 }
 
-// start запускает воркеры
+// start launches the worker goroutines.
+// It must be called before any tasks can be processed.
 func (p *pool) start() {
-	op := "start"
-
-	p.logger.Info("Starting worker pool",
-		slog.Int("workers", p.workerCount),
-		slog.Int("queue_size", cap(p.taskChan)),
-		slog.String("op", op))
-
 	for i := 0; i < p.workerCount; i++ {
 		p.wg.Add(1)
-		go p.worker(i)
+		workerID := i
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					p.logger.Error("panic in worker",
+						slog.Any("panic", r),
+						slog.String("stack", string(debug.Stack())))
+				}
+				p.wg.Done()
+			}()
+			p.worker(workerID)
+		}()
 	}
 }
 
-// stop корректно останавливает пул
+// stop initiates graceful shutdown of the pool.
+// It closes the task channel and waits for workers to finish
+// up to the configured GracefulTimeout.
 func (p *pool) stop() {
-	op := "stop"
-
 	if !p.stopping.CompareAndSwap(false, true) {
-		return // Уже останавливается
+		return
 	}
 
-	p.logger.Info("Starting worker pool shutdown", slog.String("op", op))
-	p.cancel() // Отменяем контекст, чтобы остановить все операции
-
-	// Закрываем канал задач после отмены контекста
+	p.cancel()
 	close(p.taskChan)
 
-	// Ждем завершения с таймаутом
 	done := make(chan struct{})
 	go func() {
 		p.wg.Wait()
@@ -85,20 +117,17 @@ func (p *pool) stop() {
 
 	select {
 	case <-done:
-		p.logger.Info("Worker pool fully stopped", slog.String("op", op))
+		// Normal shutdown
 	case <-time.After(p.config.GracefulTimeout):
-		p.logger.Error("Worker pool shutdown timed out", slog.String("op", op))
+		p.logger.Error("worker pool stop timeout")
 	}
 }
 
-// addTask добавляет задачу в очередь
+// addTask submits a task to the pool for execution.
+// Returns an error if the pool is stopping or the queue is full.
 func (p *pool) addTask(task Task) error {
 	if p.stopping.Load() {
-		return fmt.Errorf("pool is stopping - new tasks not accepted")
-	}
-
-	if task.Executor == nil {
-		return fmt.Errorf("task executor is nil")
+		return fmt.Errorf("pool stopping")
 	}
 
 	select {
@@ -107,115 +136,75 @@ func (p *pool) addTask(task Task) error {
 	case <-p.ctx.Done():
 		return p.ctx.Err()
 	default:
-		return fmt.Errorf("task queue is full")
+		return fmt.Errorf("task queue full")
 	}
 }
 
+// worker is the main processing loop for a pool worker.
+// It reads tasks from the channel and executes them.
 func (p *pool) worker(id int) {
-	op := "worker"
-
-	log := p.logger.With(
-		slog.String("trace_id", tracing.GetTraceID(p.ctx)), // INFO: trace_id уровня worker
-		slog.Int("worker_id", id))
-
-	defer func() {
-		if r := recover(); r != nil {
-			log.Error("Worker panic during shutdown",
-				slog.Any("panic", r),
-				slog.String("op", op))
-		}
-		log.Info("Worker stopped", slog.String("op", op))
-		p.wg.Done()
-	}()
-
-	log.Info("Worker started", slog.String("op", op))
-
 	for task := range p.taskChan {
-		taskLog := log.With(
-			slog.String("tenant_id", task.TenantID.String()),
-			slog.String("task_id", task.TaskID.String()))
-		p.runTask(task, id, taskLog)
+		if p.ctx.Err() != nil {
+			return
+		}
+		p.runTask(task, id)
 	}
-
-	log.Info("Task channel closed, worker exiting", slog.String("op", op))
 }
 
-func (p *pool) runTask(task Task, id int, log *slog.Logger) {
-	op := "run_task"
-
+// runTask executes a single task with panic recovery and completion callback.
+// This function guarantees that task.Complete is called exactly once.
+func (p *pool) runTask(task Task, workerID int) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error("Recovered from panic in task execution",
+			p.logger.Error("panic in task",
 				slog.Any("recover", r),
-				slog.String("stack", string(debug.Stack())),
-				slog.String("op", op))
+				slog.String("stack", string(debug.Stack())))
 		}
 
-		// Гарантированно вызываем Complete, даже при панике
+		// Guaranteed single execution of Complete callback
 		if task.Complete != nil {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Error("Recovered from panic in complete callback",
-						slog.Any("recover", r),
-						slog.String("stack", string(debug.Stack())),
-						slog.String("op", op))
-				}
-			}()
 			task.Complete()
 		}
 	}()
 
-	p.executeWithRetry(task, id, log)
+	p.executeWithRetry(task, workerID)
 }
 
-func (p *pool) executeWithRetry(task Task, workerID int, log *slog.Logger) {
-	op := "execute_with_retry"
-
-	defer func() {
-		if task.Complete != nil {
-			task.Complete()
-		}
-	}()
-
-	if task.Ctx == nil || p.ctx == nil {
-		log.Warn("Context is nil, skipping execution", slog.String("op", op))
-		return
-	}
+// executeWithRetry attempts to execute a task with retries and exponential backoff.
+// It respects context cancellation and pool shutdown signals.
+func (p *pool) executeWithRetry(task Task, workerID int) {
+	// Ensure trace ID is propagated for distributed tracing
+	ctxWithTrace := tracing.EnsureTraceID(task.Ctx)
 
 	var lastErr error
-
-	// Создаем контекст с trace ID один раз на всю задачу
-	ctxWithTrace := tracing.EnsureTraceID(task.Ctx)
-	taskLog := log.With(slog.String("trace_id", tracing.GetTraceID(ctxWithTrace)))
-
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
-		attemptLog := taskLog.With(
-			slog.Int("attempt", attempt),
-			slog.Int("max_attempt", p.maxAttempts))
-
 		err := task.Executor.Execute(ctxWithTrace, task.TenantID, workerID)
 		if err == nil {
-			attemptLog.Info("Task succeeded", slog.String("op", op))
-			return
+			return // Success
 		}
 
 		lastErr = err
-		attemptLog.Warn("Task attempt failed",
-			slog.Any("error", err),
-			slog.String("op", op))
 
-		// WARN: пауза перед повтором
+		// Calculate backoff delay for next attempt
 		delay := backoff.CalculateExponentialBackoff(
 			attempt,
 			p.config.RetryPolicy.Attempts.MinDelay,
 			p.config.RetryPolicy.Attempts.MaxDelay,
 		)
-		time.Sleep(delay)
+
+		// Wait for backoff period, but respect cancellation
+		select {
+		case <-time.After(delay):
+			// Continue to next attempt
+		case <-task.Ctx.Done():
+			return // Task cancelled
+		case <-p.ctx.Done():
+			return // Pool shutting down
+		}
 	}
 
-	if lastErr != nil {
-		log.Error("Task failed after all attempts",
-			slog.String("error", lastErr.Error()),
-			slog.String("op", op))
-	}
+	// All retry attempts failed
+	p.logger.Error("task failed after retries",
+		slog.String("tenant_id", task.TenantID.String()),
+		slog.Any("error", lastErr))
 }
