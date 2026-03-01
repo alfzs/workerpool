@@ -8,14 +8,14 @@ allocated share of workers and cannot exceed its concurrency limit. It consists 
 
 1. WorkerManager - Per-tenant scheduling and concurrency control
 2. Pool - Global worker pool for actual task execution
-3. Task - Unit of work that can be executed
+3. Task Registry - Registration and scheduling of periodic tasks
 
 # Core Concepts
 
 Tenant:
   - Entities that require isolated task execution
   - Each tenant has its own worker limit
-  - Tasks are triggered per tenant
+  - Tasks can be triggered per tenant
 
 Worker Limit:
   - Maximum number of concurrent tasks per tenant
@@ -26,6 +26,7 @@ Task Execution:
   - Tasks are first queued per tenant
   - Tenant workers pull tasks and submit to global pool
   - Global pool handles retries with exponential backoff
+  - Scheduled tasks can be registered for automatic execution
 
 # Usage Example
 
@@ -64,7 +65,19 @@ Task Execution:
 		manager.Start()
 		defer manager.Stop()
 
-		// Trigger task for specific tenant
+		// Create task registry for scheduled tasks
+		registry := workerpool.NewTaskRegistry(manager)
+
+		// Register a periodic task
+		err = registry.RegisterTask(
+			uuid.New(),
+			"sync_orders",
+			5*time.Minute,
+			&MyExecutor{},
+			true, // enable jitter
+		)
+
+		// Trigger one-off task for specific tenant
 		manager.Trigger(tenantID)
 	}
 

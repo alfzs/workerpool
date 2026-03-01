@@ -44,7 +44,6 @@ type taskExecutor interface {
 type WorkerManager struct {
 	logger   *slog.Logger
 	provider tenantProvider
-	executor taskExecutor
 	config   Config
 	pool     *pool
 
@@ -63,9 +62,9 @@ type WorkerManager struct {
 type tenantState struct {
 	id uuid.UUID
 
-	// queue is a signal channel for triggering task execution.
-	// Each task is represented by an empty struct to minimize memory.
-	queue chan struct{}
+	// taskQueue is a channel for incoming tasks.
+	// Each task is sent directly to the queue for processing.
+	taskQueue chan Task
 
 	// limit is the current concurrency limit for this tenant.
 	// Updated atomically when tenant configuration changes.
@@ -86,9 +85,6 @@ type WorkerManagerParams struct {
 
 	// TenantProvider supplies the list of active tenants.
 	TenantProvider tenantProvider
-
-	// TaskExecutor performs the actual work for each task.
-	TaskExecutor taskExecutor
 
 	// Config contains all tunable parameters.
 	Config Config
@@ -112,7 +108,6 @@ func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 	return &WorkerManager{
 		logger:   p.Logger.With(slog.String("component", "worker_manager")),
 		provider: p.TenantProvider,
-		executor: p.TaskExecutor,
 		config:   p.Config,
 		pool:     pool,
 		ctx:      ctx,
@@ -152,7 +147,7 @@ func (w *WorkerManager) Stop() {
 	w.tenantsMu.Lock()
 	for _, t := range w.tenants {
 		t.cancel()
-		close(t.queue)
+		close(t.taskQueue)
 	}
 	w.tenantsMu.Unlock()
 
@@ -162,24 +157,36 @@ func (w *WorkerManager) Stop() {
 	w.logger.Info("worker manager stopped")
 }
 
-// Trigger initiates task execution for the specified tenant.
-// If the tenant's queue is full, the task is dropped and a warning is logged.
+// SubmitTask submits a task for execution by the specified tenant.
+// If the tenant's queue is full, the task is dropped and an error is returned.
 // This method is non-blocking and safe to call from multiple goroutines.
-func (w *WorkerManager) Trigger(tenantID uuid.UUID) {
+func (w *WorkerManager) SubmitTask(tenantID uuid.UUID, task Task) error {
 	w.tenantsMu.RLock()
 	state, ok := w.tenants[tenantID]
 	w.tenantsMu.RUnlock()
 
 	if !ok {
-		return
+		return fmt.Errorf("tenant %s not found", tenantID)
 	}
 
 	select {
-	case state.queue <- struct{}{}:
+	case state.taskQueue <- task:
+		return nil
 	default:
-		w.logger.Warn("tenant queue full, task dropped",
-			slog.String("tenant_id", tenantID.String()))
+		return fmt.Errorf("tenant queue full")
 	}
+}
+
+// GetActiveTenants returns the IDs of all currently active tenants.
+func (w *WorkerManager) GetActiveTenants() []uuid.UUID {
+	w.tenantsMu.RLock()
+	defer w.tenantsMu.RUnlock()
+
+	tenants := make([]uuid.UUID, 0, len(w.tenants))
+	for id := range w.tenants {
+		tenants = append(tenants, id)
+	}
+	return tenants
 }
 
 // tenantRefresher periodically updates the list of active tenants.
@@ -242,7 +249,7 @@ func (w *WorkerManager) refreshTenants() error {
 	for id, state := range w.tenants {
 		if _, exists := current[id]; !exists {
 			state.cancel()
-			close(state.queue)
+			close(state.taskQueue)
 			delete(w.tenants, id)
 		}
 	}
@@ -258,11 +265,11 @@ func (w *WorkerManager) createTenant(id uuid.UUID, limit int) {
 	// Queue buffer size is 4x the worker limit to absorb bursts
 	// This is a reasonable default that prevents most drops while bounding memory
 	state := &tenantState{
-		id:       id,
-		queue:    make(chan struct{}, limit*4),
-		inflight: make(chan struct{}, limit),
-		ctx:      ctx,
-		cancel:   cancel,
+		id:        id,
+		taskQueue: make(chan Task, limit*4),
+		inflight:  make(chan struct{}, limit),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	state.limit.Store(int32(limit))
@@ -276,7 +283,7 @@ func (w *WorkerManager) createTenant(id uuid.UUID, limit int) {
 }
 
 // workerLoop is the main processing loop for a tenant worker.
-// It waits for signals on the queue, acquires an inflight slot, and executes the task.
+// It waits for tasks on the queue, acquires an inflight slot, and executes the task.
 // The loop exits when the tenant context is cancelled.
 func (w *WorkerManager) workerLoop(state *tenantState, workerID int) {
 	defer w.wg.Done()
@@ -286,7 +293,7 @@ func (w *WorkerManager) workerLoop(state *tenantState, workerID int) {
 		case <-state.ctx.Done():
 			return
 
-		case _, ok := <-state.queue:
+		case task, ok := <-state.taskQueue:
 			if !ok {
 				return
 			}
@@ -298,35 +305,21 @@ func (w *WorkerManager) workerLoop(state *tenantState, workerID int) {
 				return
 			}
 
-			w.executeTask(state, workerID)
+			w.executeTask(state, workerID, task)
 		}
 	}
 }
 
 // executeTask handles the actual task execution for a tenant worker.
-// It creates a task with timeout, submits it to the global pool, and manages cleanup.
+// It submits the task to the global pool and manages cleanup.
 // The inflight slot is released when this function returns.
-func (w *WorkerManager) executeTask(state *tenantState, workerID int) {
+func (w *WorkerManager) executeTask(state *tenantState, workerID int, task Task) {
 	// Release inflight slot when done
 	defer func() {
 		<-state.inflight
 	}()
 
-	// Create task-specific context with timeout
-	ctx, cancel := context.WithTimeout(state.ctx, w.config.TaskTimeout)
-	defer cancel()
-
-	task := Task{
-		Ctx:      ctx,
-		TaskID:   uuid.New(), // Generate unique ID for tracing
-		TenantID: state.id,
-		Executor: w.executor,
-		// Complete callback is not needed as manager tracks inflight separately
-	}
-
 	// Submit to global pool
-	// Note: addTask may block if pool queue is full, but we're protected by
-	// the inflight semaphore - only 'limit' tasks can be in this state
 	if err := w.pool.addTask(task); err != nil {
 		w.logger.Warn("failed to submit task to pool",
 			slog.String("tenant_id", state.id.String()),

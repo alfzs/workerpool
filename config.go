@@ -42,8 +42,20 @@ type PoolSize struct {
 
 // RetryPolicy defines how task execution retries are handled.
 type RetryPolicy struct {
+	// Jitter configuration for initial task scheduling
+	Jitter JitterConfig `yaml:"jitter"`
+
 	// Attempts configures the retry behavior for failed tasks.
 	Attempts AttemptsConfig `yaml:"attempts"`
+}
+
+// JitterConfig defines the parameters for random delay before first execution.
+type JitterConfig struct {
+	// MinDelay is the minimum jitter duration
+	MinDelay time.Duration `yaml:"min_delay" env-default:"5s"`
+
+	// MaxDelay is the maximum jitter duration
+	MaxDelay time.Duration `yaml:"max_delay" env-default:"10s"`
 }
 
 // AttemptsConfig defines the parameters for retry attempts.
