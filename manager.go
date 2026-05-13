@@ -30,25 +30,20 @@ type TenantTaskStats struct {
 }
 
 type WorkerManager struct {
-	logger   *slog.Logger
-	provider tenantProvider
-	executor taskExecutor
-	config   Config
-	pool     *pool
-
-	ctx    context.Context
-	cancel context.CancelFunc
-
+	logger        *slog.Logger
+	provider      tenantProvider
+	config        Config
+	pool          *pool
+	ctx           context.Context
+	cancel        context.CancelFunc
 	activeTenants sync.Map
-
-	wg       sync.WaitGroup
-	stopping atomic.Bool
+	wg            sync.WaitGroup
+	stopping      atomic.Bool
 }
 
 type WorkerManagerParams struct {
 	Logger         *slog.Logger
 	TenantProvider tenantProvider
-	TaskExecutor   taskExecutor
 	Config         Config
 }
 
@@ -68,7 +63,6 @@ func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 	return &WorkerManager{
 		logger:   p.Logger.With(slog.String("component", "worker_manager")),
 		provider: p.TenantProvider,
-		executor: p.TaskExecutor,
 		config:   p.Config,
 		pool:     pool,
 		ctx:      ctx,
@@ -98,7 +92,7 @@ func (w *WorkerManager) Stop() {
 	w.logger.Info("worker manager stopped")
 }
 
-func (w *WorkerManager) TriggerWithPriority(ctx context.Context, tenantID uuid.UUID, priority TaskPriority) error {
+func (w *WorkerManager) TaskTrigger(ctx context.Context, tenantID uuid.UUID, executor taskExecutor, priority TaskPriority) error {
 	if _, ok := w.activeTenants.Load(tenantID); !ok {
 		return fmt.Errorf("tenant %s is not active", tenantID)
 	}
@@ -109,7 +103,7 @@ func (w *WorkerManager) TriggerWithPriority(ctx context.Context, tenantID uuid.U
 		TaskID:   uuid.New(),
 		TenantID: tenantID,
 		Executor: &tenantTaskExecutor{
-			executor:    w.executor,
+			executor:    executor,
 			taskContext: taskCtx,
 		},
 		Priority: priority,
@@ -117,14 +111,6 @@ func (w *WorkerManager) TriggerWithPriority(ctx context.Context, tenantID uuid.U
 	}
 
 	return w.pool.addTask(task)
-}
-
-func (w *WorkerManager) TriggerWithContext(ctx context.Context, tenantID uuid.UUID) error {
-	return w.TriggerWithPriority(ctx, tenantID, PriorityNormal)
-}
-
-func (w *WorkerManager) Trigger(tenantID uuid.UUID) {
-	_ = w.TriggerWithContext(context.Background(), tenantID)
 }
 
 func (w *WorkerManager) refreshLoop() {
