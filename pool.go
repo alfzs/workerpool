@@ -5,323 +5,174 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math/rand"
-	"runtime/debug"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/alfzs/tracing"
-	"github.com/google/uuid"
 )
 
-// PoolTask представляет задачу для выполнения в пуле
-type PoolTask struct {
-	Ctx      context.Context
-	TaskID   uuid.UUID
-	TenantID uuid.UUID
-	Executor taskExecutor
-	Priority TaskPriority
-	Complete func()
-}
-
-type taskExecutor interface {
-	Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error
-}
-
-// priorityQueue реализует интерфейс heap.Interface
-type priorityQueue []*PoolTask
-
-func (pq priorityQueue) Len() int { return len(pq) }
-
-func (pq priorityQueue) Less(i, j int) bool {
-	if pq[i].Priority != pq[j].Priority {
-		return pq[i].Priority > pq[j].Priority
-	}
-	return pq[i].TaskID.String() < pq[j].TaskID.String()
-}
-
-func (pq priorityQueue) Swap(i, j int) {
-	pq[i], pq[j] = pq[j], pq[i]
-}
-
-func (pq *priorityQueue) Push(x interface{}) {
-	item := x.(*PoolTask)
-	*pq = append(*pq, item)
-}
-
-func (pq *priorityQueue) Pop() interface{} {
-	old := *pq
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = nil
-	*pq = old[0 : n-1]
-	return item
-}
-
 type pool struct {
-	ctx    context.Context
-	cancel context.CancelFunc
 	logger *slog.Logger
 	config Config
 
-	highQueue   chan *PoolTask
-	normalQueue chan *PoolTask
-	lowQueue    chan *PoolTask
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	overflowPQ *priorityQueue
-	pqMutex    sync.Mutex
+	mu    sync.Mutex
+	queue *priorityHeap
+	cond  *sync.Cond
 
-	wg       sync.WaitGroup
-	stopping atomic.Bool
-	closed   atomic.Bool
+	active atomic.Int64
+	stop   atomic.Bool
 
-	runningTasks sync.Map
+	retry RetryPredicate
 
-	retryPredicate RetryPredicate
-	maxAttempts    int
+	rngSeed uint64
 }
 
-type PoolParams struct {
-	Ctx            context.Context
-	Logger         *slog.Logger
-	Config         Config
-	RetryPredicate RetryPredicate
-}
+func newPool(logger *slog.Logger, cfg Config, retry RetryPredicate) *pool {
+	ctx, cancel := context.WithCancel(context.Background())
 
-func newPool(p PoolParams) (*pool, error) {
-	ctx, cancel := context.WithCancel(p.Ctx)
-
-	predicate := p.RetryPredicate
-	if predicate == nil {
-		predicate = DefaultRetryPredicate
+	p := &pool{
+		logger:  logger,
+		config:  cfg,
+		ctx:     ctx,
+		cancel:  cancel,
+		queue:   newPriorityHeap(5),
+		retry:   retry,
+		rngSeed: rand.Uint64(),
 	}
 
-	pool := &pool{
-		ctx:            ctx,
-		cancel:         cancel,
-		logger:         p.Logger.With(slog.String("component", "worker_pool")),
-		config:         p.Config,
-		highQueue:      make(chan *PoolTask, p.Config.HighPriorityQueueSize),
-		normalQueue:    make(chan *PoolTask, p.Config.NormalPriorityQueueSize),
-		lowQueue:       make(chan *PoolTask, p.Config.LowPriorityQueueSize),
-		overflowPQ:     &priorityQueue{},
-		retryPredicate: predicate,
-		maxAttempts:    p.Config.RetryPolicy.Attempts.Count,
+	if p.retry == nil {
+		p.retry = func(error) bool { return true }
 	}
-	heap.Init(pool.overflowPQ)
 
-	return pool, nil
+	p.cond = sync.NewCond(&p.mu)
+	return p
 }
 
-func (p *pool) start() {
-	totalWorkers := p.config.PoolSize.High + p.config.PoolSize.Normal + p.config.PoolSize.Low
-	for i := 0; i < totalWorkers; i++ {
-		p.wg.Add(1)
-		workerID := i
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					p.logger.Error("panic in pool worker",
-						slog.Any("panic", r),
-						slog.String("stack", string(debug.Stack())))
-					IncWorkerPanicsTotal()
-				}
-				p.wg.Done()
-			}()
-			p.worker(workerID)
-		}()
-	}
-	SetActiveWorkers(int64(totalWorkers))
+func (p *pool) context() context.Context {
+	return p.ctx
 }
 
-func (p *pool) stop() {
-	if !p.stopping.CompareAndSwap(false, true) {
+func (p *pool) Start() {
+	for i := 0; i < p.config.PoolSize.Workers; i++ {
+		go p.worker(i)
+	}
+
+	p.logger.Info("worker pool started")
+}
+
+func (p *pool) Stop() {
+	if !p.stop.CompareAndSwap(false, true) {
 		return
 	}
+
 	p.cancel()
-	p.closed.Store(true)
+	p.cond.Broadcast()
 
-	done := make(chan struct{})
-	go func() {
-		p.wg.Wait()
-		close(done)
-	}()
+	timeout := time.After(p.config.GracefulTimeout)
 
-	select {
-	case <-done:
-		p.logger.Info("worker pool stopped gracefully")
-	case <-time.After(p.config.GracefulTimeout):
-		p.logger.Error("timeout stopping worker pool")
-	}
-}
-
-func (p *pool) addTask(task *PoolTask) error {
-	if p.stopping.Load() {
-		return fmt.Errorf("pool is stopping")
-	}
-
-	if !p.tryMarkTaskRunning(task.TenantID, task.TaskID) {
-		return fmt.Errorf("task %s is already running for tenant %s", task.TaskID, task.TenantID)
-	}
-
-	originalComplete := task.Complete
-	task.Complete = func() {
-		p.unmarkTaskRunning(task.TenantID, task.TaskID)
-		if originalComplete != nil {
-			originalComplete()
-		}
-	}
-
-	var ch chan *PoolTask
-	switch task.Priority {
-	case PriorityHigh:
-		ch = p.highQueue
-	case PriorityNormal:
-		ch = p.normalQueue
-	default:
-		ch = p.lowQueue
-	}
-
-	select {
-	case ch <- task:
-		IncTasksTotal()
-		SetQueuedTasks(int64(len(p.highQueue) + len(p.normalQueue) + len(p.lowQueue) + p.overflowPQ.Len()))
-		return nil
-	default:
-		p.pqMutex.Lock()
-		heap.Push(p.overflowPQ, task)
-		p.pqMutex.Unlock()
-		IncTasksTotal()
-		SetQueuedTasks(int64(len(p.highQueue) + len(p.normalQueue) + len(p.lowQueue) + p.overflowPQ.Len()))
-		return nil
-	}
-}
-
-func (p *pool) worker(id int) {
-	for {
+	for p.active.Load() > 0 {
 		select {
-		case <-p.ctx.Done():
+		case <-timeout:
+			p.logger.Warn("shutdown timeout",
+				slog.Int64("active", p.active.Load()),
+			)
 			return
-		default:
+		case <-time.After(50 * time.Millisecond):
 		}
-
-		task := p.dequeueTask()
-		if task == nil {
-			select {
-			case <-p.ctx.Done():
-				return
-			case <-time.After(10 * time.Millisecond):
-			}
-			continue
-		}
-
-		p.runTask(task, id)
-		SetQueuedTasks(int64(len(p.highQueue) + len(p.normalQueue) + len(p.lowQueue) + p.overflowPQ.Len()))
 	}
+
+	p.logger.Info("worker pool stopped")
 }
 
-func (p *pool) dequeueTask() *PoolTask {
-	select {
-	case task := <-p.highQueue:
-		return task
-	default:
+func (p *pool) submit(task *PoolTask) error {
+	if p.stop.Load() {
+		return fmt.Errorf("pool stopped")
 	}
 
-	select {
-	case task := <-p.normalQueue:
-		return task
-	default:
+	task.createdAt = time.Now()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.queue.Len() >= p.config.QueueSize {
+		return fmt.Errorf("queue full")
 	}
 
-	p.pqMutex.Lock()
-	if p.overflowPQ.Len() > 0 {
-		task := heap.Pop(p.overflowPQ).(*PoolTask)
-		p.pqMutex.Unlock()
-		return task
-	}
-	p.pqMutex.Unlock()
+	task.effectivePriority = p.queue.compute(task)
 
-	select {
-	case task := <-p.lowQueue:
-		return task
-	default:
-	}
+	heap.Push(p.queue, task)
+	p.cond.Signal()
 
 	return nil
 }
 
-func (p *pool) tryMarkTaskRunning(tenantID, taskID uuid.UUID) bool {
-	tenantTasks, _ := p.runningTasks.LoadOrStore(tenantID, &sync.Map{})
-	tasksMap := tenantTasks.(*sync.Map)
+func (p *pool) worker(id int) {
+	for {
+		task := p.dequeue()
+		if task == nil {
+			return
+		}
 
-	_, loaded := tasksMap.LoadOrStore(taskID, struct{}{})
-	return !loaded
-}
-
-func (p *pool) unmarkTaskRunning(tenantID, taskID uuid.UUID) {
-	if tenantTasks, ok := p.runningTasks.Load(tenantID); ok {
-		tasksMap := tenantTasks.(*sync.Map)
-		tasksMap.Delete(taskID)
+		p.active.Add(1)
+		p.execute(task, id)
+		p.active.Add(-1)
 	}
 }
 
-func (p *pool) runTask(task *PoolTask, workerID int) {
-	defer func() {
-		if r := recover(); r != nil {
-			p.logger.Error("panic in task execution",
-				slog.Any("recover", r),
-				slog.String("stack", string(debug.Stack())))
-			IncWorkerPanicsTotal()
+func (p *pool) dequeue() *PoolTask {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for p.queue.Len() == 0 {
+		if p.stop.Load() {
+			return nil
 		}
-		if task.Complete != nil {
-			safeComplete(task.Complete)
+		p.cond.Wait()
+	}
+
+	return heap.Pop(p.queue).(*PoolTask)
+}
+
+func (p *pool) execute(task *PoolTask, workerID int) {
+	defer func() {
+		if task.OnComplete != nil {
+			safe(task.OnComplete)
 		}
 	}()
 
-	p.executeWithRetry(task, workerID)
-}
+	max := p.config.Retry.MaxAttempts
+	if max <= 0 {
+		max = 1
+	}
 
-func (p *pool) executeWithRetry(task *PoolTask, workerID int) {
-	ctxWithTrace := tracing.EnsureTraceID(task.Ctx)
-	ctxWithAttempt := context.WithValue(ctxWithTrace, ctxKeyAttempt{}, 0)
+	var err error
 
-	var lastErr error
-	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
-		ctxWithAttempt = context.WithValue(ctxWithTrace, ctxKeyAttempt{}, attempt)
-
-		startTime := time.Now()
-		err := task.Executor.Execute(ctxWithAttempt, task.TenantID, workerID)
-		duration := time.Since(startTime)
-		ObserveTaskDuration(duration)
-
+	for attempt := 1; attempt <= max; attempt++ {
+		err = p.run(task, workerID)
 		if err == nil {
 			return
 		}
 
-		if !p.retryPredicate(err) {
-			p.logger.Warn("non-retryable error, stopping attempts",
-				slog.String("task_id", task.TaskID.String()),
-				slog.String("tenant_id", task.TenantID.String()),
-				slog.Int("attempt", attempt),
-				slog.Any("error", err))
-			IncTasksFailedTotal()
+		if _, ok := err.(*PanicError); ok {
 			return
 		}
 
-		lastErr = err
-		IncTasksRetryTotal()
+		if task.Ctx.Err() != nil {
+			return
+		}
 
-		if attempt == p.maxAttempts {
+		if !p.retry(err) {
+			return
+		}
+
+		if attempt == max {
 			break
 		}
 
-		delay := calculateJitteredDelay(
-			attempt,
-			p.config.RetryPolicy.Attempts.MinDelay,
-			p.config.RetryPolicy.Attempts.MaxDelay,
-		)
-		ObserveRetryDelay(delay)
+		delay := p.backoff(attempt)
 
 		select {
 		case <-time.After(delay):
@@ -331,36 +182,39 @@ func (p *pool) executeWithRetry(task *PoolTask, workerID int) {
 			return
 		}
 	}
-
-	p.logger.Error("task failed after all attempts",
-		slog.String("tenant_id", task.TenantID.String()),
-		slog.String("task_id", task.TaskID.String()),
-		slog.Int("attempts", p.maxAttempts),
-		slog.Any("error", lastErr))
-	IncTasksFailedTotal()
 }
 
-func calculateJitteredDelay(attempt int, minDelay, maxDelay time.Duration) time.Duration {
-	delay := minDelay
-	for i := 1; i < attempt && delay < maxDelay; i++ {
-		delay *= 2
-	}
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-	return time.Duration(rand.Int63n(int64(delay)))
-}
-
-func safeComplete(fn func()) {
-	if fn == nil {
-		return
-	}
+func (p *pool) run(task *PoolTask, workerID int) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("panic in task completion callback",
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())))
+			err = capturePanic(task.TaskName, task.TenantID, workerID, r)
 		}
+	}()
+
+	return task.Executor.Execute(task.Ctx, task.TenantID, workerID)
+}
+
+func (p *pool) backoff(attempt int) time.Duration {
+	shift := attempt - 1
+	if shift > 30 {
+		shift = 30
+	}
+
+	delay := p.config.Retry.MinDelay * time.Duration(1<<uint(shift))
+	if delay > p.config.Retry.MaxDelay {
+		delay = p.config.Retry.MaxDelay
+	}
+
+	jitter := time.Duration(float64(delay) * 0.25)
+
+	r := rand.New(rand.NewPCG(p.rngSeed, uint64(attempt)))
+
+	return delay - jitter + time.Duration(r.Int64N(int64(jitter*2)))
+}
+
+func safe(fn func()) {
+	defer func() {
+		recover()
 	}()
 	fn()
 }

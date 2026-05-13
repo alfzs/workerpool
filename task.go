@@ -2,36 +2,52 @@ package workerpool
 
 import (
 	"context"
-	"time"
+	"fmt"
+	"runtime/debug"
 
 	"github.com/google/uuid"
 )
 
-// Task интерфейс, который должны реализовывать все задачи
-type Task interface {
-	// Execute выполняет задачу для конкретного тенанта
-	Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error
-
-	// GetName возвращает человекочитаемое имя задачи
-	GetName() string
-
-	// GetID возвращает уникальный идентификатор типа задачи
-	// Важно: этот ID должен быть одинаковым для всех экземпляров одного типа задачи
-	GetID() uuid.UUID
-
-	// GetPriority возвращает приоритет задачи
-	GetPriority() TaskPriority
-
-	// GetTimeout возвращает опциональный таймаут для задачи
-	// Если nil, используется глобальный таймаут из конфига
-	GetTimeout() *time.Duration
-}
-
-// TaskPriority определяет приоритет задачи
 type TaskPriority int
 
 const (
-	PriorityLow    TaskPriority = 0
-	PriorityNormal TaskPriority = 1
-	PriorityHigh   TaskPriority = 2
+	PriorityLow TaskPriority = iota
+	PriorityNormal
+	PriorityHigh
 )
+
+type Task interface {
+	Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error
+}
+
+type RetryPredicate func(error) bool
+
+type PanicError struct {
+	TaskName string
+	TenantID uuid.UUID
+	WorkerID int
+	Value    any
+	Stack    string
+}
+
+func (e *PanicError) Error() string {
+	return fmt.Sprintf(
+		"panic in task=%s tenant=%s worker=%d value=%v",
+		e.TaskName,
+		e.TenantID,
+		e.WorkerID,
+		e.Value,
+	)
+}
+
+var _ error = (*PanicError)(nil)
+
+func capturePanic(taskName string, tenantID uuid.UUID, workerID int, r any) *PanicError {
+	return &PanicError{
+		TaskName: taskName,
+		TenantID: tenantID,
+		WorkerID: workerID,
+		Value:    r,
+		Stack:    string(debug.Stack()),
+	}
+}
