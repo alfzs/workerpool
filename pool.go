@@ -15,17 +15,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// TaskPriority определяет приоритет задачи.
-type TaskPriority int
-
-const (
-	PriorityLow    TaskPriority = 0
-	PriorityNormal TaskPriority = 1
-	PriorityHigh   TaskPriority = 2
-)
-
-// Task представляет задачу для выполнения в пуле.
-type Task struct {
+// PoolTask представляет задачу для выполнения в пуле
+type PoolTask struct {
 	Ctx      context.Context
 	TaskID   uuid.UUID
 	TenantID uuid.UUID
@@ -34,8 +25,12 @@ type Task struct {
 	Complete func()
 }
 
-// priorityQueue реализует интерфейс heap.Interface для очереди с приоритетами.
-type priorityQueue []*Task
+type taskExecutor interface {
+	Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error
+}
+
+// priorityQueue реализует интерфейс heap.Interface
+type priorityQueue []*PoolTask
 
 func (pq priorityQueue) Len() int { return len(pq) }
 
@@ -51,7 +46,7 @@ func (pq priorityQueue) Swap(i, j int) {
 }
 
 func (pq *priorityQueue) Push(x interface{}) {
-	item := x.(*Task)
+	item := x.(*PoolTask)
 	*pq = append(*pq, item)
 }
 
@@ -70,9 +65,9 @@ type pool struct {
 	logger *slog.Logger
 	config Config
 
-	highQueue   chan *Task
-	normalQueue chan *Task
-	lowQueue    chan *Task
+	highQueue   chan *PoolTask
+	normalQueue chan *PoolTask
+	lowQueue    chan *PoolTask
 
 	overflowPQ *priorityQueue
 	pqMutex    sync.Mutex
@@ -107,9 +102,9 @@ func newPool(p PoolParams) (*pool, error) {
 		cancel:         cancel,
 		logger:         p.Logger.With(slog.String("component", "worker_pool")),
 		config:         p.Config,
-		highQueue:      make(chan *Task, p.Config.HighPriorityQueueSize),
-		normalQueue:    make(chan *Task, p.Config.NormalPriorityQueueSize),
-		lowQueue:       make(chan *Task, p.Config.LowPriorityQueueSize),
+		highQueue:      make(chan *PoolTask, p.Config.HighPriorityQueueSize),
+		normalQueue:    make(chan *PoolTask, p.Config.NormalPriorityQueueSize),
+		lowQueue:       make(chan *PoolTask, p.Config.LowPriorityQueueSize),
 		overflowPQ:     &priorityQueue{},
 		retryPredicate: predicate,
 		maxAttempts:    p.Config.RetryPolicy.Attempts.Count,
@@ -161,7 +156,7 @@ func (p *pool) stop() {
 	}
 }
 
-func (p *pool) addTask(task *Task) error {
+func (p *pool) addTask(task *PoolTask) error {
 	if p.stopping.Load() {
 		return fmt.Errorf("pool is stopping")
 	}
@@ -178,7 +173,7 @@ func (p *pool) addTask(task *Task) error {
 		}
 	}
 
-	var ch chan *Task
+	var ch chan *PoolTask
 	switch task.Priority {
 	case PriorityHigh:
 		ch = p.highQueue
@@ -226,7 +221,7 @@ func (p *pool) worker(id int) {
 	}
 }
 
-func (p *pool) dequeueTask() *Task {
+func (p *pool) dequeueTask() *PoolTask {
 	select {
 	case task := <-p.highQueue:
 		return task
@@ -241,7 +236,7 @@ func (p *pool) dequeueTask() *Task {
 
 	p.pqMutex.Lock()
 	if p.overflowPQ.Len() > 0 {
-		task := heap.Pop(p.overflowPQ).(*Task)
+		task := heap.Pop(p.overflowPQ).(*PoolTask)
 		p.pqMutex.Unlock()
 		return task
 	}
@@ -271,7 +266,7 @@ func (p *pool) unmarkTaskRunning(tenantID, taskID uuid.UUID) {
 	}
 }
 
-func (p *pool) runTask(task *Task, workerID int) {
+func (p *pool) runTask(task *PoolTask, workerID int) {
 	defer func() {
 		if r := recover(); r != nil {
 			p.logger.Error("panic in task execution",
@@ -287,7 +282,7 @@ func (p *pool) runTask(task *Task, workerID int) {
 	p.executeWithRetry(task, workerID)
 }
 
-func (p *pool) executeWithRetry(task *Task, workerID int) {
+func (p *pool) executeWithRetry(task *PoolTask, workerID int) {
 	ctxWithTrace := tracing.EnsureTraceID(task.Ctx)
 	ctxWithAttempt := context.WithValue(ctxWithTrace, ctxKeyAttempt{}, 0)
 

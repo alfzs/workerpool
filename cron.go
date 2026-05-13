@@ -14,16 +14,13 @@ import (
 type CronSchedule struct {
 	ID       uuid.UUID
 	CronExpr string
-	// TaskID ссылается на зарегистрированную задачу
-	TaskID uuid.UUID
-	Config CronTaskConfig
+	TaskID   uuid.UUID // Ссылка на зарегистрированную задачу
+	Config   CronTaskConfig
 }
 
 type CronTaskConfig struct {
 	OverrideTimeout *time.Duration
 	AllowOverlap    bool
-	// Priority можно переопределить для cron-запусков
-	Priority *TaskPriority
 }
 
 type cronJob struct {
@@ -60,15 +57,14 @@ func (cm *cronManager) Stop() {
 	cm.cron.Stop()
 }
 
-// RegisterSchedule регистрирует cron-расписание для зарегистрированной задачи
 func (cm *cronManager) RegisterSchedule(schedule CronSchedule) error {
 	if schedule.ID == uuid.Nil {
 		schedule.ID = uuid.New()
 	}
 
-	// Проверяем, что задача с таким TaskID зарегистрирована
-	if _, err := cm.workerMgr.GetRegisteredTask(schedule.TaskID); err != nil {
-		return fmt.Errorf("task %s not registered: %w", schedule.TaskID, err)
+	// Проверяем, что задача зарегистрирована
+	if _, err := cm.workerMgr.GetTask(schedule.TaskID); err != nil {
+		return fmt.Errorf("task not registered: %w", err)
 	}
 
 	if _, exists := cm.schedules.Load(schedule.ID); exists {
@@ -116,7 +112,7 @@ func (j *cronJob) Run() {
 	defer j.mu.Unlock()
 
 	// Получаем зарегистрированную задачу
-	task, err := j.manager.workerMgr.GetRegisteredTask(j.schedule.TaskID)
+	task, err := j.manager.workerMgr.GetTask(j.schedule.TaskID)
 	if err != nil {
 		j.manager.logger.Error("task not found for cron schedule",
 			"schedule_id", j.schedule.ID.String(),
@@ -125,7 +121,6 @@ func (j *cronJob) Run() {
 		return
 	}
 
-	// Создаём контекст с таймаутом
 	timeout := j.manager.config.CronTaskTimeout
 	if j.schedule.Config.OverrideTimeout != nil {
 		timeout = *j.schedule.Config.OverrideTimeout
@@ -138,20 +133,11 @@ func (j *cronJob) Run() {
 	if err := j.manager.workerMgr.executeTaskForAllTenants(ctx, task); err != nil {
 		j.manager.logger.Warn("cron task execution had errors",
 			"schedule_id", j.schedule.ID.String(),
-			"task_name", task.Name,
+			"task_name", task.GetName(),
 			"error", err)
 	}
 
 	j.manager.logger.Debug("cron job executed",
 		"schedule_id", j.schedule.ID.String(),
-		"task_name", task.Name)
-}
-
-// GetRegisteredTask нужно добавить в WorkerManager
-func (w *WorkerManager) GetRegisteredTask(taskID uuid.UUID) (*RegisteredTask, error) {
-	value, ok := w.registeredTasks.Load(taskID)
-	if !ok {
-		return nil, fmt.Errorf("task with ID %s not found", taskID)
-	}
-	return value.(*RegisteredTask), nil
+		"task_name", task.GetName())
 }
