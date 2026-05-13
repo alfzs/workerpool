@@ -2,59 +2,53 @@ package workerpool
 
 import "time"
 
-// Config holds all configuration parameters for the worker pool.
-// All fields have sensible defaults and can be overridden via YAML or environment variables.
+// Config содержит все параметры конфигурации воркер-пула.
 type Config struct {
-	// TaskQueueSize is the capacity of the global task queue.
-	// If the queue is full, additional tasks will be rejected with an error.
+	// TaskQueueSize — ёмкость глобальной очереди задач.
+	// При заполнении новые задачи отклоняются с ошибкой.
 	TaskQueueSize int `yaml:"task_queue_size" env-default:"100"`
 
-	// GracefulTimeout is the maximum duration to wait for running tasks to complete
-	// during shutdown. After this timeout, remaining tasks are cancelled.
+	// GracefulTimeout — максимальное время ожидания завершения задач при остановке.
 	GracefulTimeout time.Duration `yaml:"graceful_timeout" env-default:"5m"`
 
-	// TaskTimeout is the maximum execution time for a single task.
-	// Tasks exceeding this timeout are cancelled.
+	// TaskTimeout — максимальное время выполнения одной задачи.
 	TaskTimeout time.Duration `yaml:"task_timeout" env-default:"5m"`
 
-	// RetryPolicy defines how failed tasks are retried.
+	// RetryPolicy — политика повторных попыток для упавших задач.
 	RetryPolicy RetryPolicy `yaml:"retry_policy"`
 
-	// PoolSize defines the number of workers in the global pool for different priority levels.
+	// PoolSize — количество воркеров в глобальном пуле.
 	PoolSize PoolSize `yaml:"pool_size"`
 }
 
-// PoolSize defines worker counts for different pool configurations.
-// These can be used to prioritize different types of workloads.
+// PoolSize определяет количество воркеров для разных приоритетов.
 type PoolSize struct {
-	// Single worker pool - for sequential operations
+	// Single — для последовательных операций
 	Single int `yaml:"single" env-default:"1"`
 
-	// Low priority pool - for background tasks
+	// Low — для фоновых задач
 	Low int `yaml:"low" env-default:"8"`
 
-	// Normal priority pool - for standard operations
+	// Normal — для стандартных операций
 	Normal int `yaml:"normal" env-default:"32"`
 
-	// High priority pool - for time-sensitive operations
+	// High — для чувствительных ко времени операций
 	High int `yaml:"high" env-default:"64"`
 }
 
-// RetryPolicy defines how task execution retries are handled.
+// RetryPolicy определяет поведение повторных попыток.
 type RetryPolicy struct {
-	// Attempts configures the retry behavior for failed tasks.
 	Attempts AttemptsConfig `yaml:"attempts"`
 }
 
-// AttemptsConfig defines the parameters for retry attempts.
+// AttemptsConfig параметры повторных попыток.
 type AttemptsConfig struct {
-	// Count is the maximum number of execution attempts (including the first).
-	// If set to 3, a task will be tried up to 3 times before failing.
+	// Count — максимальное количество попыток (включая первую)
 	Count int `yaml:"count" env-default:"3"`
 
-	// MinDelay is the initial delay before the first retry.
+	// MinDelay — начальная задержка перед первой ретраем
 	MinDelay time.Duration `yaml:"min_delay" env-default:"1s"`
 
-	// MaxDelay is the maximum delay between retries (cap for exponential backoff).
+	// MaxDelay — максимальная задержка между ретраями
 	MaxDelay time.Duration `yaml:"max_delay" env-default:"5s"`
 }

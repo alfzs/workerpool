@@ -1,85 +1,73 @@
+// pool.go
 package workerpool
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/alfzs/backoff"
 	"github.com/alfzs/tracing"
 	"github.com/google/uuid"
 )
 
-// Task represents a unit of work to be executed by the worker pool.
-// It contains all necessary context and metadata for execution.
 type Task struct {
-	// Ctx is the context for this task, including timeout and cancellation.
-	Ctx context.Context
-
-	// TaskID uniquely identifies this task instance.
-	TaskID uuid.UUID
-
-	// TenantID identifies which tenant this task belongs to.
+	Ctx      context.Context
+	TaskID   uuid.UUID
 	TenantID uuid.UUID
-
-	// Executor is the function that performs the actual work.
 	Executor taskExecutor
-
-	// Complete is an optional callback that is called after task execution
-	// (whether successful or failed). It is guaranteed to be called exactly once.
 	Complete func()
 }
 
-// pool is a fixed-size worker pool that executes tasks with retry logic.
-// It provides a global execution capacity shared across all tenants.
 type pool struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	logger *slog.Logger
-	config Config
-
-	// taskChan is the buffered channel for incoming tasks
-	taskChan chan Task
-
-	// workerCount is the number of concurrent workers
+	ctx         context.Context
+	cancel      context.CancelFunc
+	logger      *slog.Logger
+	config      Config
+	taskChan    chan Task
 	workerCount int
-
-	// maxAttempts is the number of retry attempts per task
 	maxAttempts int
-
-	wg       sync.WaitGroup
-	stopping atomic.Bool
+	wg          sync.WaitGroup
+	stopping    atomic.Bool
+	closed      atomic.Bool
+	// retryPredicate — пользовательская логика проверки ретраев
+	retryPredicate RetryPredicate
 }
 
-// PoolParams contains parameters for creating a new pool.
 type PoolParams struct {
 	Ctx    context.Context
 	Logger *slog.Logger
 	Config Config
+	// RetryPredicate — опциональная кастомная логика проверки ретраев.
+	// Если nil, используется DefaultRetryPredicate.
+	RetryPredicate RetryPredicate
 }
 
-// newPool creates a new worker pool with the given configuration.
-// The pool is initially stopped; call Start() to begin processing.
 func newPool(p PoolParams) (*pool, error) {
 	ctx, cancel := context.WithCancel(p.Ctx)
 
+	// Устанавливаем предикат по умолчанию, если не передан
+	predicate := p.RetryPredicate
+	if predicate == nil {
+		predicate = DefaultRetryPredicate
+	}
+
 	return &pool{
-		ctx:         ctx,
-		cancel:      cancel,
-		logger:      p.Logger.With(slog.String("component", "worker_pool")),
-		config:      p.Config,
-		workerCount: p.Config.PoolSize.Normal,
-		maxAttempts: p.Config.RetryPolicy.Attempts.Count,
-		taskChan:    make(chan Task, p.Config.TaskQueueSize),
+		ctx:            ctx,
+		cancel:         cancel,
+		logger:         p.Logger.With(slog.String("component", "worker_pool")),
+		config:         p.Config,
+		workerCount:    p.Config.PoolSize.Normal,
+		maxAttempts:    p.Config.RetryPolicy.Attempts.Count,
+		taskChan:       make(chan Task, p.Config.TaskQueueSize),
+		retryPredicate: predicate,
 	}, nil
 }
 
-// start launches the worker goroutines.
-// It must be called before any tasks can be processed.
 func (p *pool) start() {
 	for i := 0; i < p.workerCount; i++ {
 		p.wg.Add(1)
@@ -87,9 +75,10 @@ func (p *pool) start() {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					p.logger.Error("panic in worker",
+					p.logger.Error("panic in pool worker",
 						slog.Any("panic", r),
 						slog.String("stack", string(debug.Stack())))
+					IncWorkerPanicsTotal()
 				}
 				p.wg.Done()
 			}()
@@ -98,16 +87,13 @@ func (p *pool) start() {
 	}
 }
 
-// stop initiates graceful shutdown of the pool.
-// It closes the task channel and waits for workers to finish
-// up to the configured GracefulTimeout.
 func (p *pool) stop() {
 	if !p.stopping.CompareAndSwap(false, true) {
 		return
 	}
 
 	p.cancel()
-	close(p.taskChan)
+	p.closed.Store(true)
 
 	done := make(chan struct{})
 	go func() {
@@ -117,94 +103,145 @@ func (p *pool) stop() {
 
 	select {
 	case <-done:
-		// Normal shutdown
 	case <-time.After(p.config.GracefulTimeout):
-		p.logger.Error("worker pool stop timeout")
+		p.logger.Error("timeout stopping worker pool")
 	}
 }
 
-// addTask submits a task to the pool for execution.
-// Returns an error if the pool is stopping or the queue is full.
 func (p *pool) addTask(task Task) error {
 	if p.stopping.Load() {
-		return fmt.Errorf("pool stopping")
+		return fmt.Errorf("pool is stopping")
+	}
+
+	if p.closed.Load() {
+		return fmt.Errorf("pool is closed")
 	}
 
 	select {
 	case p.taskChan <- task:
+		IncTasksTotal()
+		SetQueuedTasks(int64(len(p.taskChan)))
 		return nil
 	case <-p.ctx.Done():
 		return p.ctx.Err()
 	default:
-		return fmt.Errorf("task queue full")
+		IncTasksDroppedTotal()
+		return fmt.Errorf("task queue is full")
 	}
 }
 
-// worker is the main processing loop for a pool worker.
-// It reads tasks from the channel and executes them.
 func (p *pool) worker(id int) {
-	for task := range p.taskChan {
-		if p.ctx.Err() != nil {
+	for {
+		select {
+		case <-p.ctx.Done():
 			return
+		case task, ok := <-p.taskChan:
+			if !ok {
+				return
+			}
+			p.runTask(task, id)
+			SetQueuedTasks(int64(len(p.taskChan)))
 		}
-		p.runTask(task, id)
 	}
 }
 
-// runTask executes a single task with panic recovery and completion callback.
-// This function guarantees that task.Complete is called exactly once.
 func (p *pool) runTask(task Task, workerID int) {
 	defer func() {
 		if r := recover(); r != nil {
-			p.logger.Error("panic in task",
+			p.logger.Error("panic in task execution",
 				slog.Any("recover", r),
 				slog.String("stack", string(debug.Stack())))
+			IncWorkerPanicsTotal()
 		}
-
-		// Guaranteed single execution of Complete callback
-		if task.Complete != nil {
-			task.Complete()
-		}
+		safeComplete(task.Complete)
 	}()
 
 	p.executeWithRetry(task, workerID)
 }
 
-// executeWithRetry attempts to execute a task with retries and exponential backoff.
-// It respects context cancellation and pool shutdown signals.
+func calculateJitteredDelay(attempt int, minDelay, maxDelay time.Duration) time.Duration {
+	delay := minDelay
+	for i := 1; i < attempt && delay < maxDelay; i++ {
+		delay *= 2
+	}
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+
+	return time.Duration(rand.Int63n(int64(delay)))
+}
+
 func (p *pool) executeWithRetry(task Task, workerID int) {
-	// Ensure trace ID is propagated for distributed tracing
 	ctxWithTrace := tracing.EnsureTraceID(task.Ctx)
+	ctxWithAttempt := context.WithValue(ctxWithTrace, ctxKeyAttempt{}, 0)
 
 	var lastErr error
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
-		err := task.Executor.Execute(ctxWithTrace, task.TenantID, workerID)
+		ctxWithAttempt = context.WithValue(ctxWithTrace, ctxKeyAttempt{}, attempt)
+
+		startTime := time.Now()
+		err := task.Executor.Execute(ctxWithAttempt, task.TenantID, workerID)
+		duration := time.Since(startTime)
+		ObserveTaskDuration(duration)
+
 		if err == nil {
-			return // Success
+			return
+		}
+
+		// Проверяем, можно ли ретраить
+		if !p.retryPredicate(err) {
+			p.logger.Warn("non-retryable error, stopping attempts",
+				slog.String("task_id", task.TaskID.String()),
+				slog.String("tenant_id", task.TenantID.String()),
+				slog.Int("attempt", attempt),
+				slog.Any("error", err))
+			IncTasksFailedTotal()
+			return
 		}
 
 		lastErr = err
+		IncTasksRetryTotal()
 
-		// Calculate backoff delay for next attempt
-		delay := backoff.CalculateExponentialBackoff(
+		if attempt == p.maxAttempts {
+			break
+		}
+
+		delay := calculateJitteredDelay(
 			attempt,
 			p.config.RetryPolicy.Attempts.MinDelay,
 			p.config.RetryPolicy.Attempts.MaxDelay,
 		)
+		ObserveRetryDelay(delay)
 
-		// Wait for backoff period, but respect cancellation
 		select {
 		case <-time.After(delay):
-			// Continue to next attempt
 		case <-task.Ctx.Done():
-			return // Task cancelled
+			return
 		case <-p.ctx.Done():
-			return // Pool shutting down
+			return
 		}
 	}
 
-	// All retry attempts failed
-	p.logger.Error("task failed after retries",
+	p.logger.Error("task failed after all attempts",
 		slog.String("tenant_id", task.TenantID.String()),
+		slog.String("task_id", task.TaskID.String()),
+		slog.Int("attempts", p.maxAttempts),
 		slog.Any("error", lastErr))
+	IncTasksFailedTotal()
+}
+
+func safeComplete(fn func()) {
+	if fn == nil {
+		return
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in task completion callback",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())))
+		}
+	}()
+
+	fn()
 }
