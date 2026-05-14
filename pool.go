@@ -30,25 +30,27 @@ type pool struct {
 func newPool(logger *slog.Logger, config Config, retry RetryPredicate) *pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	scheduler := newDRRScheduler(
+		config.DefaultQuantum,
+		config.MaxTenantQueue,
+		config.TenantQuantumResolver,
+	)
+
+	rng := rand.New(
+		rand.NewPCG(
+			rand.Uint64(),
+			rand.Uint64(),
+		),
+	)
+
 	p := &pool{
-		logger: logger.With(
-			slog.String("component", "worker_pool"),
-		),
-		config: config,
-		ctx:    ctx,
-		cancel: cancel,
-		scheduler: newDRRScheduler(
-			config.DefaultQuantum,
-			config.MaxTenantQueue,
-			config.TenantQuantumResolver,
-		),
+		logger:         logger.With(slog.String("component", "worker_pool")),
+		config:         config,
+		ctx:            ctx,
+		cancel:         cancel,
+		scheduler:      scheduler,
 		retryPredicate: retry,
-		rng: rand.New(
-			rand.NewPCG(
-				rand.Uint64(),
-				rand.Uint64(),
-			),
-		),
+		rng:            rng,
 	}
 
 	p.cond = sync.NewCond(&p.mu)
@@ -151,10 +153,7 @@ func (p *pool) worker(workerID int) {
 	}
 }
 
-func (p *pool) execute(
-	task *PoolTask,
-	workerID int,
-) {
+func (p *pool) execute(task *PoolTask, workerID int) {
 
 	defer func() {
 		if task.OnComplete != nil {
@@ -203,20 +202,12 @@ func (p *pool) execute(
 		}
 	}
 
-	p.logger.Error(
-		"task failed",
-		"task",
-		task.TaskName,
-		"error",
-		lastErr,
-	)
+	p.logger.Error("task failed",
+		slog.String("task", task.TaskName),
+		slog.Any("error", lastErr))
 }
 
-func (p *pool) executeSafely(
-	task *PoolTask,
-	workerID int,
-) (err error) {
-
+func (p *pool) executeSafely(task *PoolTask, workerID int) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = &PanicError{
@@ -228,37 +219,20 @@ func (p *pool) executeSafely(
 		}
 	}()
 
-	return task.Task.Execute(
-		task.Ctx,
-		task.TenantID,
-		workerID,
-	)
+	return task.Task.Execute(task.Ctx, task.TenantID, workerID)
 }
 
 func (p *pool) backoff(attempt int) time.Duration {
 	p.rngMu.Lock()
 	defer p.rngMu.Unlock()
 
-	return calculateBackoff(
-		p.rng,
-		attempt,
-		p.config.Retry.MinDelay,
-		p.config.Retry.MaxDelay,
-	)
+	return calculateBackoff(p.rng, attempt, p.config.Retry.MinDelay, p.config.Retry.MaxDelay)
 }
 
-func safeCall(
-	logger *slog.Logger,
-	fn func(),
-) {
-
+func safeCall(logger *slog.Logger, fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error(
-				"panic in callback",
-				"panic",
-				r,
-			)
+			logger.Error("panic in callback", slog.Any("panic", r))
 		}
 	}()
 

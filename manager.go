@@ -48,7 +48,7 @@ type WorkerManager struct {
 
 	config Config
 
-	registry *Registry
+	registry *TaskRegistry
 
 	running *taskLocks
 }
@@ -56,7 +56,7 @@ type WorkerManager struct {
 type WorkerManagerParams struct {
 	Logger   *slog.Logger
 	Config   Config
-	Registry *Registry
+	Registry *TaskRegistry
 }
 
 func NewWorkerManager(p WorkerManagerParams) *WorkerManager {
@@ -82,19 +82,13 @@ func (m *WorkerManager) Stop() {
 }
 
 func (m *WorkerManager) ExecuteTask(ctx context.Context, taskName string, tenantID uuid.UUID) error {
-	key := fmt.Sprintf(
-		"%s:%s",
-		tenantID.String(),
-		taskName,
-	)
+	key := fmt.Sprintf("%s:%s", tenantID.String(), taskName)
 
 	if !m.running.TryLock(key) {
-		return fmt.Errorf(
-			"task already running",
-		)
+		return fmt.Errorf("task already running")
 	}
 
-	task, err := m.registry.Create(taskName)
+	task, err := m.registry.Load(taskName)
 	if err != nil {
 		m.running.Unlock(key)
 		return err
@@ -108,16 +102,18 @@ func (m *WorkerManager) ExecuteTask(ctx context.Context, taskName string, tenant
 
 	taskCtx, cancel := context.WithTimeout(m.pool.context(), timeout)
 
+	onComplete := func() {
+		cancel()
+		m.running.Unlock(key)
+	}
+
 	poolTask := &PoolTask{
-		Ctx:       taskCtx,
-		TenantID:  tenantID,
-		TaskName:  task.Name(),
-		Task:      task,
-		CreatedAt: time.Now(),
-		OnComplete: func() {
-			cancel()
-			m.running.Unlock(key)
-		},
+		Ctx:        taskCtx,
+		TenantID:   tenantID,
+		TaskName:   task.Name(),
+		Task:       task,
+		CreatedAt:  time.Now(),
+		OnComplete: onComplete,
 	}
 
 	if err := m.pool.submit(poolTask); err != nil {

@@ -10,10 +10,5 @@ type PanicError struct {
 }
 
 func (e *PanicError) Error() string {
-	return fmt.Sprintf(
-		"panic in task=%s worker=%d: %v",
-		e.TaskName,
-		e.WorkerID,
-		e.Value,
-	)
+	return fmt.Sprintf("panic in task=%s worker=%d: %v", e.TaskName, e.WorkerID, e.Value)
 }
