@@ -96,7 +96,6 @@ func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	pool, err := newPool(PoolParams{
-		Ctx:    ctx,
 		Logger: p.Logger,
 		Config: p.Config,
 	})

@@ -37,8 +37,6 @@ type Task struct {
 // pool is a fixed-size worker pool that executes tasks with retry logic.
 // It provides a global execution capacity shared across all tenants.
 type pool struct {
-	ctx    context.Context
-	cancel context.CancelFunc
 	logger *slog.Logger
 	config Config
 
@@ -57,7 +55,6 @@ type pool struct {
 
 // PoolParams contains parameters for creating a new pool.
 type PoolParams struct {
-	Ctx    context.Context
 	Logger *slog.Logger
 	Config Config
 }
@@ -65,11 +62,7 @@ type PoolParams struct {
 // newPool creates a new worker pool with the given configuration.
 // The pool is initially stopped; call Start() to begin processing.
 func newPool(p PoolParams) (*pool, error) {
-	ctx, cancel := context.WithCancel(p.Ctx)
-
 	return &pool{
-		ctx:         ctx,
-		cancel:      cancel,
 		logger:      p.Logger.With(slog.String("component", "worker_pool")),
 		config:      p.Config,
 		workerCount: p.Config.PoolSize.Normal,
@@ -106,7 +99,6 @@ func (p *pool) stop() {
 		return
 	}
 
-	p.cancel()
 	close(p.taskChan)
 
 	done := make(chan struct{})
@@ -117,9 +109,9 @@ func (p *pool) stop() {
 
 	select {
 	case <-done:
-		// Normal shutdown
+		p.logger.Info("Worker pool stopped gracefully")
 	case <-time.After(p.config.GracefulTimeout):
-		p.logger.Error("worker pool stop timeout")
+		p.logger.Error("Worker pool stop timeout")
 	}
 }
 
@@ -133,8 +125,7 @@ func (p *pool) addTask(task Task) error {
 	select {
 	case p.taskChan <- task:
 		return nil
-	case <-p.ctx.Done():
-		return p.ctx.Err()
+
 	default:
 		return fmt.Errorf("task queue full")
 	}
@@ -144,9 +135,6 @@ func (p *pool) addTask(task Task) error {
 // It reads tasks from the channel and executes them.
 func (p *pool) worker(id int) {
 	for task := range p.taskChan {
-		if p.ctx.Err() != nil {
-			return
-		}
 		p.runTask(task, id)
 	}
 }
@@ -198,8 +186,6 @@ func (p *pool) executeWithRetry(task Task, workerID int) {
 			// Continue to next attempt
 		case <-task.Ctx.Done():
 			return // Task cancelled
-		case <-p.ctx.Done():
-			return // Pool shutting down
 		}
 	}
 
