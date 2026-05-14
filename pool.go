@@ -1,53 +1,61 @@
 package workerpool
 
 import (
-	"container/heap"
 	"context"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type pool struct {
-	logger *slog.Logger
-	config Config
-
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	mu    sync.Mutex
-	queue *priorityHeap
-	cond  *sync.Cond
-
-	active atomic.Int64
-	stop   atomic.Bool
-
-	retry RetryPredicate
-
-	rngSeed uint64
+	logger         *slog.Logger
+	config         Config
+	ctx            context.Context
+	cancel         context.CancelFunc
+	mu             sync.Mutex
+	cond           *sync.Cond
+	scheduler      *drrScheduler
+	wg             sync.WaitGroup
+	activeCount    atomic.Int64
+	stopped        atomic.Bool
+	retryPredicate RetryPredicate
+	rngMu          sync.Mutex
+	rng            *rand.Rand
 }
 
-func newPool(logger *slog.Logger, cfg Config, retry RetryPredicate) *pool {
+func newPool(logger *slog.Logger, config Config, retry RetryPredicate) *pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &pool{
-		logger:  logger,
-		config:  cfg,
-		ctx:     ctx,
-		cancel:  cancel,
-		queue:   newPriorityHeap(5),
-		retry:   retry,
-		rngSeed: rand.Uint64(),
-	}
-
-	if p.retry == nil {
-		p.retry = func(error) bool { return true }
+		logger: logger.With(
+			slog.String("component", "worker_pool"),
+		),
+		config: config,
+		ctx:    ctx,
+		cancel: cancel,
+		scheduler: newDRRScheduler(
+			config.DefaultQuantum,
+			config.MaxTenantQueue,
+		),
+		retryPredicate: retry,
+		rng: rand.New(
+			rand.NewPCG(
+				rand.Uint64(),
+				rand.Uint64(),
+			),
+		),
 	}
 
 	p.cond = sync.NewCond(&p.mu)
+
+	if p.retryPredicate == nil {
+		p.retryPredicate = DefaultRetryPredicate
+	}
+
 	return p
 }
 
@@ -55,106 +63,119 @@ func (p *pool) context() context.Context {
 	return p.ctx
 }
 
-func (p *pool) Start() {
-	for i := 0; i < p.config.PoolSize.Workers; i++ {
+func (p *pool) start() {
+	for i := 0; i < p.config.Workers; i++ {
+		p.wg.Add(1)
 		go p.worker(i)
 	}
-
-	p.logger.Info("worker pool started")
 }
 
-func (p *pool) Stop() {
-	if !p.stop.CompareAndSwap(false, true) {
+func (p *pool) stop() {
+	if !p.stopped.CompareAndSwap(false, true) {
 		return
 	}
 
 	p.cancel()
+
 	p.cond.Broadcast()
 
-	timeout := time.After(p.config.GracefulTimeout)
+	done := make(chan struct{})
 
-	for p.active.Load() > 0 {
-		select {
-		case <-timeout:
-			p.logger.Warn("shutdown timeout",
-				slog.Int64("active", p.active.Load()),
-			)
-			return
-		case <-time.After(50 * time.Millisecond):
+	go func() {
+		for p.activeCount.Load() > 0 {
+			time.Sleep(50 * time.Millisecond)
 		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(p.config.GracefulTimeout):
 	}
 
-	p.logger.Info("worker pool stopped")
+	p.cond.Broadcast()
+
+	p.wg.Wait()
 }
 
 func (p *pool) submit(task *PoolTask) error {
-	if p.stop.Load() {
+	if p.stopped.Load() {
 		return fmt.Errorf("pool stopped")
 	}
-
-	task.createdAt = time.Now()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.queue.Len() >= p.config.QueueSize {
-		return fmt.Errorf("queue full")
+	if err := p.scheduler.enqueue(task); err != nil {
+		return err
 	}
 
-	task.effectivePriority = p.queue.compute(task)
-
-	heap.Push(p.queue, task)
 	p.cond.Signal()
 
 	return nil
-}
-
-func (p *pool) worker(id int) {
-	for {
-		task := p.dequeue()
-		if task == nil {
-			return
-		}
-
-		p.active.Add(1)
-		p.execute(task, id)
-		p.active.Add(-1)
-	}
 }
 
 func (p *pool) dequeue() *PoolTask {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for p.queue.Len() == 0 {
-		if p.stop.Load() {
+	for {
+		if p.stopped.Load() {
 			return nil
 		}
+
+		task := p.scheduler.dequeue()
+		if task != nil {
+			return task
+		}
+
 		p.cond.Wait()
 	}
-
-	return heap.Pop(p.queue).(*PoolTask)
 }
 
-func (p *pool) execute(task *PoolTask, workerID int) {
+func (p *pool) worker(workerID int) {
+	defer p.wg.Done()
+
+	for {
+		task := p.dequeue()
+		if task == nil {
+			return
+		}
+
+		p.activeCount.Add(1)
+
+		p.execute(task, workerID)
+
+		p.activeCount.Add(-1)
+	}
+}
+
+func (p *pool) execute(
+	task *PoolTask,
+	workerID int,
+) {
+
 	defer func() {
 		if task.OnComplete != nil {
-			safe(task.OnComplete)
+			safeCall(p.logger, task.OnComplete)
 		}
 	}()
 
-	max := p.config.Retry.MaxAttempts
-	if max <= 0 {
-		max = 1
+	maxAttempts := p.config.Retry.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 1
 	}
 
-	var err error
+	var lastErr error
 
-	for attempt := 1; attempt <= max; attempt++ {
-		err = p.run(task, workerID)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := p.executeSafely(task, workerID)
+
 		if err == nil {
 			return
 		}
+
+		lastErr = err
 
 		if _, ok := err.(*PanicError); ok {
 			return
@@ -164,11 +185,11 @@ func (p *pool) execute(task *PoolTask, workerID int) {
 			return
 		}
 
-		if !p.retry(err) {
+		if !p.retryPredicate(err) {
 			return
 		}
 
-		if attempt == max {
+		if attempt == maxAttempts {
 			break
 		}
 
@@ -178,43 +199,67 @@ func (p *pool) execute(task *PoolTask, workerID int) {
 		case <-time.After(delay):
 		case <-task.Ctx.Done():
 			return
-		case <-p.ctx.Done():
-			return
 		}
 	}
+
+	p.logger.Error(
+		"task failed",
+		"task",
+		task.TaskName,
+		"error",
+		lastErr,
+	)
 }
 
-func (p *pool) run(task *PoolTask, workerID int) (err error) {
+func (p *pool) executeSafely(
+	task *PoolTask,
+	workerID int,
+) (err error) {
+
 	defer func() {
 		if r := recover(); r != nil {
-			err = capturePanic(task.TaskName, task.TenantID, workerID, r)
+			err = &PanicError{
+				TaskName: task.TaskName,
+				WorkerID: workerID,
+				Value:    r,
+				Stack:    string(debug.Stack()),
+			}
 		}
 	}()
 
-	return task.Executor.Execute(task.Ctx, task.TenantID, workerID)
+	return task.Task.Execute(
+		task.Ctx,
+		task.TenantID,
+		workerID,
+	)
 }
 
 func (p *pool) backoff(attempt int) time.Duration {
-	shift := attempt - 1
-	if shift > 30 {
-		shift = 30
-	}
+	p.rngMu.Lock()
+	defer p.rngMu.Unlock()
 
-	delay := p.config.Retry.MinDelay * time.Duration(1<<uint(shift))
-	if delay > p.config.Retry.MaxDelay {
-		delay = p.config.Retry.MaxDelay
-	}
-
-	jitter := time.Duration(float64(delay) * 0.25)
-
-	r := rand.New(rand.NewPCG(p.rngSeed, uint64(attempt)))
-
-	return delay - jitter + time.Duration(r.Int64N(int64(jitter*2)))
+	return calculateBackoff(
+		p.rng,
+		attempt,
+		p.config.Retry.MinDelay,
+		p.config.Retry.MaxDelay,
+	)
 }
 
-func safe(fn func()) {
+func safeCall(
+	logger *slog.Logger,
+	fn func(),
+) {
+
 	defer func() {
-		recover()
+		if r := recover(); r != nil {
+			logger.Error(
+				"panic in callback",
+				"panic",
+				r,
+			)
+		}
 	}()
+
 	fn()
 }

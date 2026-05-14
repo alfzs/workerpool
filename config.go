@@ -3,17 +3,20 @@ package workerpool
 import "time"
 
 type Config struct {
+	Workers         int
 	QueueSize       int
-	TaskTimeout     time.Duration
 	GracefulTimeout time.Duration
+	TaskTimeout     time.Duration
 
-	PoolSize struct {
-		Workers int
-	}
+	Retry RetryConfig
 
-	Retry struct {
-		MaxAttempts int
-		MinDelay    time.Duration
-		MaxDelay    time.Duration
-	}
+	// tenant quotas
+	DefaultQuantum int64
+	MaxTenantQueue int
+}
+
+type RetryConfig struct {
+	MaxAttempts int
+	MinDelay    time.Duration
+	MaxDelay    time.Duration
 }
