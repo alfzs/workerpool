@@ -3,6 +3,8 @@ package workerpool
 import (
 	"container/list"
 	"fmt"
+
+	"github.com/google/uuid"
 )
 
 type drrScheduler struct {
@@ -12,15 +14,36 @@ type drrScheduler struct {
 
 	defaultQuantum int64
 	maxTenantQueue int
+
+	tenantQuantumResolver TenantQuantumResolver
 }
 
-func newDRRScheduler(defaultQuantum int64, maxTenantQueue int) *drrScheduler {
+func newDRRScheduler(
+	defaultQuantum int64,
+	maxTenantQueue int,
+	resolver TenantQuantumResolver,
+) *drrScheduler {
+
 	return &drrScheduler{
-		tenants:        make(map[string]*tenantQueue),
-		active:         list.New(),
-		defaultQuantum: defaultQuantum,
-		maxTenantQueue: maxTenantQueue,
+		tenants:               make(map[string]*tenantQueue),
+		active:                list.New(),
+		defaultQuantum:        defaultQuantum,
+		maxTenantQueue:        maxTenantQueue,
+		tenantQuantumResolver: resolver,
 	}
+}
+
+func (s *drrScheduler) quantumForTenant(
+	tenantID uuid.UUID,
+) int64 {
+
+	if s.tenantQuantumResolver != nil {
+		if q := s.tenantQuantumResolver(tenantID); q > 0 {
+			return q
+		}
+	}
+
+	return s.defaultQuantum
 }
 
 func (s *drrScheduler) enqueue(task *PoolTask) error {
@@ -30,7 +53,7 @@ func (s *drrScheduler) enqueue(task *PoolTask) error {
 	if !exists {
 		q = newTenantQueue(
 			tenantID,
-			s.defaultQuantum,
+			s.quantumForTenant(task.TenantID),
 		)
 
 		s.tenants[tenantID] = q
@@ -41,6 +64,11 @@ func (s *drrScheduler) enqueue(task *PoolTask) error {
 			"tenant queue full tenant=%s",
 			tenantID,
 		)
+	}
+
+	// live quantum refresh
+	if updatedQuantum := s.quantumForTenant(task.TenantID); updatedQuantum > 0 {
+		q.quantum = updatedQuantum
 	}
 
 	q.push(task)

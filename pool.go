@@ -40,6 +40,7 @@ func newPool(logger *slog.Logger, config Config, retry RetryPredicate) *pool {
 		scheduler: newDRRScheduler(
 			config.DefaultQuantum,
 			config.MaxTenantQueue,
+			config.TenantQuantumResolver,
 		),
 		retryPredicate: retry,
 		rng: rand.New(
