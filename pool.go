@@ -65,7 +65,7 @@ func newPool(p PoolParams) (*pool, error) {
 	return &pool{
 		logger:      p.Logger.With(slog.String("component", "worker_pool")),
 		config:      p.Config,
-		workerCount: p.Config.PoolSize.Normal,
+		workerCount: p.Config.WorkerCount,
 		maxAttempts: p.Config.RetryPolicy.Attempts.Count,
 		taskChan:    make(chan Task, p.Config.TaskQueueSize),
 	}, nil

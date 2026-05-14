@@ -20,24 +20,8 @@ type Config struct {
 	// RetryPolicy defines how failed tasks are retried.
 	RetryPolicy RetryPolicy `yaml:"retry_policy"`
 
-	// PoolSize defines the number of workers in the global pool for different priority levels.
-	PoolSize PoolSize `yaml:"pool_size"`
-}
-
-// PoolSize defines worker counts for different pool configurations.
-// These can be used to prioritize different types of workloads.
-type PoolSize struct {
-	// Single worker pool - for sequential operations
-	Single int `yaml:"single" env-default:"1"`
-
-	// Low priority pool - for background tasks
-	Low int `yaml:"low" env-default:"8"`
-
-	// Normal priority pool - for standard operations
-	Normal int `yaml:"normal" env-default:"32"`
-
-	// High priority pool - for time-sensitive operations
-	High int `yaml:"high" env-default:"64"`
+	// WorkerCount defines the number of workers in the global pool for different priority levels.
+	WorkerCount int `yaml:"worker_count" env-default:"256"`
 }
 
 // RetryPolicy defines how task execution retries are handled.
