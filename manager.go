@@ -58,21 +58,28 @@ type WorkerManager struct {
 }
 
 // tenantState holds runtime state for a single tenant.
-// All fields are protected by the tenant's context or atomic operations.
+//
+// taskQueue is never closed: it has multiple senders (any goroutine calling
+// SubmitTask) and multiple readers across worker generations, so closing it
+// would race with SubmitTask and could panic on send-to-closed-channel.
+// Lifecycle is signalled purely via context cancellation.
+//
+// limit/genCancel are only mutated under WorkerManager.tenantsMu (by
+// createTenant/refreshTenants), so no separate lock is needed here.
 type tenantState struct {
 	id uuid.UUID
 
-	// taskQueue is a channel for incoming tasks.
-	// Each task is sent directly to the queue for processing.
+	// taskQueue is a channel for incoming tasks. Sized once at creation based
+	// on the initial limit; later limit changes do not resize it.
 	taskQueue chan Task
 
-	// limit is the current concurrency limit for this tenant.
-	// Updated atomically when tenant configuration changes.
-	limit atomic.Int32
+	// limit is the number of workers in the current generation.
+	limit int
 
-	// inflight is a counting semaphore implemented as a buffered channel.
-	// It limits the number of concurrently executing tasks.
-	inflight chan struct{}
+	// genCancel cancels the current worker generation (derived from ctx).
+	// Used to stop/restart workers when limit changes without touching
+	// taskQueue or ctx.
+	genCancel context.CancelFunc
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -143,10 +150,17 @@ func (w *WorkerManager) Stop() {
 	w.logger.Info("Stopping worker manager")
 	w.cancel()
 
+	// Cancelling each tenant's ctx (which is the parent of its current
+	// genCtx) stops all workers. taskQueue is intentionally not closed
+	// (see tenantState comment).
+	//
+	// Taking tenantsMu here, after stopping=true was set, establishes
+	// happens-before with refreshTenants: refreshTenants checks stopping
+	// under the same lock before doing wg.Add, so no wg.Add can race with
+	// wg.Wait below.
 	w.tenantsMu.Lock()
 	for _, t := range w.tenants {
 		t.cancel()
-		close(t.taskQueue)
 	}
 	w.tenantsMu.Unlock()
 
@@ -157,8 +171,9 @@ func (w *WorkerManager) Stop() {
 }
 
 // SubmitTask submits a task for execution by the specified tenant.
-// If the tenant's queue is full, the task is dropped and an error is returned.
-// This method is non-blocking and safe to call from multiple goroutines.
+// If the tenant's queue is full or the tenant is shutting down, the task is
+// dropped and an error is returned. This method is non-blocking and safe to
+// call from multiple goroutines.
 func (w *WorkerManager) SubmitTask(tenantID uuid.UUID, task Task) error {
 	w.tenantsMu.RLock()
 	state, ok := w.tenants[tenantID]
@@ -171,6 +186,8 @@ func (w *WorkerManager) SubmitTask(tenantID uuid.UUID, task Task) error {
 	select {
 	case state.taskQueue <- task:
 		return nil
+	case <-state.ctx.Done():
+		return fmt.Errorf("tenant %s is shutting down", tenantID)
 	default:
 		return fmt.Errorf("tenant queue full")
 	}
@@ -209,8 +226,8 @@ func (w *WorkerManager) tenantRefresher() {
 }
 
 // refreshTenants updates the internal tenant state to match the current active tenants.
-// It adds new tenants, updates limits for existing tenants, and removes inactive ones.
-// Must be called with tenantsMu held for writing.
+// It adds new tenants, adjusts worker counts for existing tenants on limit change,
+// and removes inactive ones. Acquires tenantsMu itself.
 func (w *WorkerManager) refreshTenants() error {
 	active, err := w.provider.GetActive(w.ctx)
 	if err != nil {
@@ -219,6 +236,12 @@ func (w *WorkerManager) refreshTenants() error {
 
 	w.tenantsMu.Lock()
 	defer w.tenantsMu.Unlock()
+
+	// See Stop(): this check, performed under tenantsMu, prevents wg.Add
+	// (via createTenant/setWorkerCount) from racing with wg.Wait.
+	if w.stopping.Load() {
+		return nil
+	}
 
 	current := make(map[uuid.UUID]struct{}, len(active))
 
@@ -235,20 +258,17 @@ func (w *WorkerManager) refreshTenants() error {
 		}
 
 		if state, ok := w.tenants[id]; ok {
-			// Update limit for existing tenant
-			state.limit.Store(int32(limit))
+			w.setWorkerCount(state, limit)
 			continue
 		}
 
-		// Create new tenant
 		w.createTenant(id, limit)
 	}
 
-	// Remove tenants that are no longer active
+	// Remove tenants that are no longer active.
 	for id, state := range w.tenants {
 		if _, exists := current[id]; !exists {
 			state.cancel()
-			close(state.taskQueue)
 			delete(w.tenants, id)
 		}
 	}
@@ -257,72 +277,97 @@ func (w *WorkerManager) refreshTenants() error {
 }
 
 // createTenant initializes a new tenant with the given ID and worker limit.
-// It creates the tenant's queue, inflight semaphore, and starts the required number of workers.
+// Caller must hold tenantsMu.
 func (w *WorkerManager) createTenant(id uuid.UUID, limit int) {
 	ctx, cancel := context.WithCancel(w.ctx)
 
-	// Queue buffer size is 4x the worker limit to absorb bursts
-	// This is a reasonable default that prevents most drops while bounding memory
+	// Queue buffer size is 4x the initial worker limit to absorb bursts.
+	// Not resized on later limit changes.
 	state := &tenantState{
 		id:        id,
 		taskQueue: make(chan Task, limit*4),
-		inflight:  make(chan struct{}, limit),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
 
-	state.limit.Store(int32(limit))
 	w.tenants[id] = state
+	w.setWorkerCount(state, limit)
+}
 
-	// Start exactly 'limit' workers for this tenant
+// setWorkerCount (re)starts the tenant's worker generation with exactly
+// `limit` workers. The previous generation (if any) is cancelled via
+// genCancel: those workers finish the task they're currently holding
+// (executeTask stops waiting on genCtx.Done but the task keeps running in
+// the pool to completion) and then exit on their next loop iteration.
+//
+// taskQueue is shared and unbuffered-safe across generations since it is
+// never closed. Caller must hold tenantsMu.
+func (w *WorkerManager) setWorkerCount(state *tenantState, limit int) {
+	if state.limit == limit && state.genCancel != nil {
+		return
+	}
+
+	if state.genCancel != nil {
+		state.genCancel()
+	}
+
+	genCtx, genCancel := context.WithCancel(state.ctx)
+	state.genCancel = genCancel
+	state.limit = limit
+
 	for workerID := 0; workerID < limit; workerID++ {
 		w.wg.Add(1)
-		go w.workerLoop(state, workerID)
+		go w.workerLoop(state, genCtx, workerID)
 	}
 }
 
-// workerLoop is the main processing loop for a tenant worker.
-// It waits for tasks on the queue, acquires an inflight slot, and executes the task.
-// The loop exits when the tenant context is cancelled.
-func (w *WorkerManager) workerLoop(state *tenantState, workerID int) {
+// workerLoop is the main processing loop for a tenant worker generation.
+// It exits when genCtx is cancelled (tenant removed or limit changed).
+func (w *WorkerManager) workerLoop(state *tenantState, genCtx context.Context, workerID int) {
 	defer w.wg.Done()
 
 	for {
 		select {
-		case <-state.ctx.Done():
+		case <-genCtx.Done():
 			return
-
-		case task, ok := <-state.taskQueue:
-			if !ok {
-				return
-			}
-
-			// Acquire inflight slot before executing
-			select {
-			case state.inflight <- struct{}{}:
-			case <-state.ctx.Done():
-				return
-			}
-
-			w.executeTask(state, workerID, task)
+		case task := <-state.taskQueue:
+			w.executeTask(state, genCtx, workerID, task)
 		}
 	}
 }
 
-// executeTask handles the actual task execution for a tenant worker.
-// It submits the task to the global pool and manages cleanup.
-// The inflight slot is released when this function returns.
-func (w *WorkerManager) executeTask(state *tenantState, workerID int, task Task) {
-	// Release inflight slot when done
-	defer func() {
-		<-state.inflight
-	}()
+// executeTask submits the task to the global pool and blocks until the pool
+// has actually finished executing it (or genCtx is cancelled). This is what
+// makes "limit workers" mean "at most `limit` of this tenant's tasks running
+// in the pool concurrently" - the previous inflight-semaphore design released
+// its slot right after enqueueing, so it enforced nothing.
+//
+// task.Complete is wrapped so it fires exactly once regardless of whether the
+// pool ever runs the task (addTask can fail before the task reaches the pool).
+func (w *WorkerManager) executeTask(state *tenantState, genCtx context.Context, workerID int, task Task) {
+	done := make(chan struct{})
+	originalComplete := task.Complete
+	task.Complete = func() {
+		if originalComplete != nil {
+			originalComplete()
+		}
+		close(done)
+	}
 
-	// Submit to global pool
 	if err := w.pool.addTask(task); err != nil {
 		w.logger.Warn("Failed to submit task to pool",
 			slog.String("tenant_id", state.id.String()),
 			slog.Int("worker_id", workerID),
 			slog.Any("error", err))
+		task.Complete() // pool will never run it, so it will never call Complete itself
+		return
+	}
+
+	select {
+	case <-done:
+	case <-genCtx.Done():
+		// Generation is being torn down (limit change or tenant removal).
+		// The task keeps running in the pool and its Complete will still
+		// fire, but this worker stops waiting so it can exit promptly.
 	}
 }

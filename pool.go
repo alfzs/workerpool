@@ -40,13 +40,20 @@ type pool struct {
 	logger *slog.Logger
 	config Config
 
-	// taskChan is the buffered channel for incoming tasks
+	// taskChan is the buffered channel for incoming tasks.
 	taskChan chan Task
 
-	// workerCount is the number of concurrent workers
+	// closeMu guards the invariant "no send on taskChan happens after it is
+	// closed": addTask holds RLock while checking stopping and sending;
+	// stop() holds Lock while closing. This prevents send-on-closed-channel
+	// panics under concurrent addTask/stop.
+	closeMu sync.RWMutex
+
+	// workerCount is the number of concurrent workers.
 	workerCount int
 
-	// maxAttempts is the number of retry attempts per task
+	// maxAttempts is the number of retry attempts per task. Treated as 1 if
+	// configured as <= 0, since 0 attempts would mean Execute is never called.
 	maxAttempts int
 
 	wg       sync.WaitGroup
@@ -62,11 +69,16 @@ type PoolParams struct {
 // newPool creates a new worker pool with the given configuration.
 // The pool is initially stopped; call Start() to begin processing.
 func newPool(p PoolParams) (*pool, error) {
+	maxAttempts := p.Config.RetryPolicy.Attempts.Count
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+
 	return &pool{
 		logger:      p.Logger.With(slog.String("component", "worker_pool")),
 		config:      p.Config,
 		workerCount: p.Config.WorkerCount,
-		maxAttempts: p.Config.RetryPolicy.Attempts.Count,
+		maxAttempts: maxAttempts,
 		taskChan:    make(chan Task, p.Config.TaskQueueSize),
 	}, nil
 }
@@ -99,7 +111,11 @@ func (p *pool) stop() {
 		return
 	}
 
+	// Lock excludes any in-flight addTask (which holds RLock), so taskChan
+	// is only closed once no goroutine can be mid-send on it.
+	p.closeMu.Lock()
 	close(p.taskChan)
+	p.closeMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -118,6 +134,9 @@ func (p *pool) stop() {
 // addTask submits a task to the pool for execution.
 // Returns an error if the pool is stopping or the queue is full.
 func (p *pool) addTask(task Task) error {
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
+
 	if p.stopping.Load() {
 		return fmt.Errorf("pool stopping")
 	}
@@ -149,7 +168,7 @@ func (p *pool) runTask(task Task, workerID int) {
 				slog.String("stack", string(debug.Stack())))
 		}
 
-		// Guaranteed single execution of Complete callback
+		// Guaranteed single execution of Complete callback.
 		if task.Complete != nil {
 			task.Complete()
 		}
@@ -161,7 +180,6 @@ func (p *pool) runTask(task Task, workerID int) {
 // executeWithRetry attempts to execute a task with retries and exponential backoff.
 // It respects context cancellation and pool shutdown signals.
 func (p *pool) executeWithRetry(task Task, workerID int) {
-	// Ensure trace ID is propagated for distributed tracing
 	ctxWithTrace := tracing.EnsureTraceID(task.Ctx)
 
 	var lastErr error
@@ -173,23 +191,23 @@ func (p *pool) executeWithRetry(task Task, workerID int) {
 
 		lastErr = err
 
-		// Calculate backoff delay for next attempt
+		if attempt == p.maxAttempts {
+			break // last attempt failed, no point sleeping before reporting
+		}
+
 		delay := backoff.CalculateExponentialBackoff(
 			attempt,
 			p.config.RetryPolicy.Attempts.MinDelay,
 			p.config.RetryPolicy.Attempts.MaxDelay,
 		)
 
-		// Wait for backoff period, but respect cancellation
 		select {
 		case <-time.After(delay):
-			// Continue to next attempt
 		case <-task.Ctx.Done():
 			return // Task cancelled
 		}
 	}
 
-	// All retry attempts failed
 	p.logger.Error("Task failed after retries",
 		slog.String("tenant_id", task.TenantID.String()),
 		slog.Any("error", lastErr))

@@ -14,20 +14,20 @@ import (
 // TaskDefinition represents a registered task that executes on a schedule.
 // Each task has a unique identifier and execution interval.
 type TaskDefinition struct {
-	// ID uniquely identifies this task
+	// ID uniquely identifies this task.
 	ID uuid.UUID
 
-	// Name is a human-readable name for logging
+	// Name is a human-readable name for logging.
 	Name string
 
-	// Interval specifies how often the task should execute
+	// Interval specifies how often the task should execute.
 	Interval time.Duration
 
-	// Executor is the function that performs the actual work
+	// Executor is the function that performs the actual work.
 	Executor taskExecutor
 
 	// JitterEnabled adds random delay before first execution
-	// to distribute load across tasks
+	// to distribute load across tasks.
 	JitterEnabled bool
 }
 
@@ -57,24 +57,6 @@ func NewTaskRegistry(manager *WorkerManager) *TaskRegistry {
 
 // RegisterTask registers a new task for periodic execution.
 // The task will automatically execute for all active tenants at the specified interval.
-//
-// Parameters:
-//   - taskID: unique identifier for the task (use uuid.New())
-//   - name: human-readable name for logging
-//   - interval: how often to execute the task
-//   - executor: function that performs the actual work
-//   - enableJitter: add random delay before first execution to distribute load
-//
-// Example:
-//
-//	taskID := uuid.New()
-//	err := registry.RegisterTask(
-//	    taskID,
-//	    "sync_orders",
-//	    5*time.Minute,
-//	    &SyncOrdersExecutor{},
-//	    true,
-//	)
 func (r *TaskRegistry) RegisterTask(
 	taskID uuid.UUID,
 	name string,
@@ -95,7 +77,6 @@ func (r *TaskRegistry) RegisterTask(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Check if task already registered
 	if _, exists := r.tasks[taskID]; exists {
 		return fmt.Errorf("task with ID %s already registered", taskID)
 	}
@@ -109,8 +90,6 @@ func (r *TaskRegistry) RegisterTask(
 	}
 
 	r.tasks[taskID] = task
-
-	// Start scheduler for this task
 	r.startScheduler(task)
 
 	r.logger.Info("Task registered",
@@ -131,7 +110,6 @@ func (r *TaskRegistry) UnregisterTask(taskID uuid.UUID) error {
 		return fmt.Errorf("task %s not found", taskID)
 	}
 
-	// Stop the scheduler
 	if cancel, exists := r.cancels[taskID]; exists {
 		cancel()
 		delete(r.cancels, taskID)
@@ -146,8 +124,23 @@ func (r *TaskRegistry) UnregisterTask(taskID uuid.UUID) error {
 	return nil
 }
 
+// Stop cancels all running schedulers and clears the registry. Intended for
+// use during application shutdown alongside WorkerManager.Stop(); without it
+// scheduler goroutines keep firing (and harmlessly failing SubmitTask once
+// tenants are torn down) for the remaining lifetime of the process.
+func (r *TaskRegistry) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for taskID, cancel := range r.cancels {
+		cancel()
+		delete(r.cancels, taskID)
+	}
+	r.tasks = make(map[uuid.UUID]*TaskDefinition)
+}
+
 // startScheduler launches a goroutine that periodically executes the task
-// for all active tenants.
+// for all active tenants. Caller must hold r.mu.
 func (r *TaskRegistry) startScheduler(task *TaskDefinition) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancels[task.ID] = cancel
@@ -162,7 +155,6 @@ func (r *TaskRegistry) startScheduler(task *TaskDefinition) {
 			}
 		}()
 
-		// Add jitter before first execution if enabled
 		if task.JitterEnabled {
 			jitter := r.calculateJitter()
 			r.logger.Debug("Adding jitter before first run",
@@ -176,7 +168,6 @@ func (r *TaskRegistry) startScheduler(task *TaskDefinition) {
 			}
 		}
 
-		// Create ticker for periodic execution
 		ticker := time.NewTicker(task.Interval)
 		defer ticker.Stop()
 
@@ -203,7 +194,6 @@ func (r *TaskRegistry) executeForAllTenants(task *TaskDefinition) {
 	}
 
 	for _, tenantID := range tenants {
-		// Create task with timeout
 		ctx, cancel := context.WithTimeout(context.Background(), r.config.TaskTimeout)
 
 		taskInstance := Task{
@@ -214,9 +204,8 @@ func (r *TaskRegistry) executeForAllTenants(task *TaskDefinition) {
 			Complete: cancel,
 		}
 
-		// Submit to tenant's queue
 		if err := r.manager.SubmitTask(tenantID, taskInstance); err != nil {
-			cancel() // Clean up if submission fails
+			cancel()
 			r.logger.Warn("Failed to submit scheduled task",
 				slog.String("task_id", task.ID.String()),
 				slog.String("name", task.Name),
@@ -226,8 +215,14 @@ func (r *TaskRegistry) executeForAllTenants(task *TaskDefinition) {
 	}
 }
 
-// calculateJitter computes a random delay between MinDelay and MaxDelay
-// to distribute task execution across the cluster.
+// calculateJitter computes a delay before the first execution to spread load.
+//
+// NOTE: this always calls CalculateExponentialBackoff with attempt=1. If that
+// function's randomization depends on the attempt number (rather than being
+// random per call), every process/instance would compute the same jitter for
+// the same task, defeating the "distribute load across the cluster" goal
+// described above. Worth verifying against the actual implementation in
+// github.com/alfzs/backoff.
 func (r *TaskRegistry) calculateJitter() time.Duration {
 	return backoff.CalculateExponentialBackoff(
 		1,
