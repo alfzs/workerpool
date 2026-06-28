@@ -4,115 +4,176 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/alfzs/backoff"
-	"github.com/alfzs/tracing"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/google/uuid"
 )
 
-// Task represents a unit of work to be executed by the worker pool.
-// It contains all necessary context and metadata for execution.
+// Task — единица работы, передаваемая в пул.
+// Поля Ctx, TaskID, TenantID, Executor заполняются вызывающим кодом до Submit;
+// Complete оборачивается внутри диспетчера и не должен изменяться после
+// передачи задачи.
 type Task struct {
-	// Ctx is the context for this task, including timeout and cancellation.
+	// Ctx — контекст задачи с дедлайном и сигналом отмены.
+	// Если Ctx содержит активный OTel-span (например, из River worker или
+	// HTTP-обработчика), span пула станет его дочерним — иерархия
+	// трассировки выстраивается автоматически через контекст.
 	Ctx context.Context
 
-	// TaskID uniquely identifies this task instance.
+	// TaskID — уникальный идентификатор конкретного запуска
+	// (например, ID job в River). Используется в логах и атрибутах span.
 	TaskID uuid.UUID
 
-	// TenantID identifies which tenant this task belongs to.
+	// TenantID — идентификатор тенанта; используется для маршрутизации,
+	// логирования и атрибутов метрик.
 	TenantID uuid.UUID
 
-	// Executor is the function that performs the actual work.
-	Executor taskExecutor
+	// ExecutorKey — строковый ключ для разрешения executor'а через
+	// ExecutorRegistry. Заполняется, если executor хранится в реестре
+	// (типичный случай при использовании River как job store).
+	ExecutorKey string
 
-	// Complete is an optional callback that is called after task execution
-	// (whether successful or failed). It is guaranteed to be called exactly once.
-	Complete func()
+	// Executor — реализация, вызываемая напрямую. Имеет приоритет над
+	// ExecutorKey. Удобна для разовых задач без регистрации в реестре.
+	Executor TaskExecutor
+
+	// Complete вызывается ровно один раз после завершения задачи —
+	// успешного, после исчерпания повторных попыток, после паники или
+	// при остановке диспетчера. err == nil означает успех.
+	Complete func(err error)
 }
 
-// pool is a fixed-size worker pool that executes tasks with retry logic.
-// It provides a global execution capacity shared across all tenants.
+// pool — разделяемый пул фиксированного размера, исполняющий задачи всех
+// тенантов. Управляет горутинами-воркерами, повторными попытками и OTel.
 type pool struct {
+	// logger инициализируется из slog.Default() с атрибутом component=pool.
 	logger *slog.Logger
-	config Config
 
-	// taskChan is the buffered channel for incoming tasks.
-	taskChan chan Task
-
-	// closeMu guards the invariant "no send on taskChan happens after it is
-	// closed": addTask holds RLock while checking stopping and sending;
-	// stop() holds Lock while closing. This prevents send-on-closed-channel
-	// panics under concurrent addTask/stop.
-	closeMu sync.RWMutex
-
-	// workerCount is the number of concurrent workers.
+	config      Config
+	taskChan    chan Task
 	workerCount int
-
-	// maxAttempts is the number of retry attempts per task. Treated as 1 if
-	// configured as <= 0, since 0 attempts would mean Execute is never called.
 	maxAttempts int
+
+	// closeMu защищает инвариант «отправка в taskChan не происходит после его
+	// закрытия»: addTask удерживает RLock при проверке stopping и отправке;
+	// stop() удерживает Lock при закрытии канала.
+	closeMu sync.RWMutex
 
 	wg       sync.WaitGroup
 	stopping atomic.Bool
+
+	// forceCtx отменяется по истечении GracefulTimeout, распространяя
+	// отмену во все активные контексты задач.
+	forceCtx    context.Context
+	forceCancel context.CancelFunc
+
+	// OTel-инструменты; инициализируются из глобального провайдера.
+	// Если приложение не настроило провайдер — используется noop.
+	tracer       trace.Tracer
+	taskDuration metric.Float64Histogram
+	tasksTotal   metric.Int64Counter
 }
 
-// PoolParams contains parameters for creating a new pool.
-type PoolParams struct {
-	Logger *slog.Logger
-	Config Config
+// poolParams — внутренние параметры для создания пула.
+type poolParams struct {
+	config Config
 }
 
-// newPool creates a new worker pool with the given configuration.
-// The pool is initially stopped; call Start() to begin processing.
-func newPool(p PoolParams) (*pool, error) {
-	maxAttempts := p.Config.RetryPolicy.Attempts.Count
+// newPool создаёт пул. Конфигурация должна быть провалидирована до вызова.
+func newPool(p poolParams) (*pool, error) {
+	maxAttempts := p.config.RetryPolicy.Attempts.Count
 	if maxAttempts <= 0 {
 		maxAttempts = 1
 	}
 
+	forceCtx, forceCancel := context.WithCancel(context.Background())
+
+	// Используем глобальные OTel-провайдеры. Если приложение не настроило их,
+	// возвращается noop-реализация без накладных расходов.
+	tracer := otel.GetTracerProvider().Tracer("workerpool")
+	meter := otel.GetMeterProvider().Meter("workerpool")
+
+	dur, err := meter.Float64Histogram(
+		"workerpool.task.duration",
+		metric.WithDescription("task execution duration in seconds"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		forceCancel()
+		return nil, fmt.Errorf("create duration histogram: %w", err)
+	}
+
+	total, err := meter.Int64Counter(
+		"workerpool.tasks.total",
+		metric.WithDescription("total tasks completed, partitioned by status"),
+	)
+	if err != nil {
+		forceCancel()
+		return nil, fmt.Errorf("create tasks counter: %w", err)
+	}
+
 	return &pool{
-		logger:      p.Logger.With(slog.String("component", "worker_pool")),
-		config:      p.Config,
-		workerCount: p.Config.WorkerCount,
-		maxAttempts: maxAttempts,
-		taskChan:    make(chan Task, p.Config.TaskQueueSize),
+		logger:       slog.Default().With(slog.String("component", "pool")),
+		config:       p.config,
+		workerCount:  p.config.WorkerCount,
+		maxAttempts:  maxAttempts,
+		taskChan:     make(chan Task, p.config.TaskQueueSize),
+		forceCtx:     forceCtx,
+		forceCancel:  forceCancel,
+		tracer:       tracer,
+		taskDuration: dur,
+		tasksTotal:   total,
 	}, nil
 }
 
-// start launches the worker goroutines.
-// It must be called before any tasks can be processed.
+// start запускает горутины-воркеры. Должен вызываться до первого addTask.
 func (p *pool) start() {
-	for i := 0; i < p.workerCount; i++ {
-		p.wg.Add(1)
-		workerID := i
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					p.logger.Error("Panic in worker",
-						slog.Any("panic", r),
-						slog.String("stack", string(debug.Stack())))
-				}
-				p.wg.Done()
-			}()
-			p.worker(workerID)
-		}()
+	for workerID := range p.workerCount {
+		p.wg.Go(func() { p.runWorker(workerID) })
 	}
 }
 
-// stop initiates graceful shutdown of the pool.
-// It closes the task channel and waits for workers to finish
-// up to the configured GracefulTimeout.
+// runWorker — цикл одной горутины-воркера. После паники автоматически
+// перезапускается, пока пул не переходит в состояние остановки.
+// Нормальный выход из worker() означает, что taskChan закрыт и опустошён.
+func (p *pool) runWorker(id int) {
+	for {
+		panicked := true
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					p.logger.Error("worker panic",
+						slog.Int("worker_id", id),
+						slog.Any("panic", r),
+						slog.String("stack", string(debug.Stack())))
+				}
+			}()
+			p.worker(id)
+			panicked = false
+		}()
+		if !panicked || p.stopping.Load() {
+			return
+		}
+	}
+}
+
+// stop закрывает taskChan и ожидает завершения воркеров.
+// При истечении GracefulTimeout вызывает forceCancel и блокируется
+// до выхода всех горутин.
 func (p *pool) stop() {
 	if !p.stopping.CompareAndSwap(false, true) {
 		return
 	}
 
-	// Lock excludes any in-flight addTask (which holds RLock), so taskChan
-	// is only closed once no goroutine can be mid-send on it.
 	p.closeMu.Lock()
 	close(p.taskChan)
 	p.closeMu.Unlock()
@@ -125,90 +186,160 @@ func (p *pool) stop() {
 
 	select {
 	case <-done:
-		p.logger.Info("Worker pool stopped gracefully")
+		p.logger.Info("pool stopped gracefully")
 	case <-time.After(p.config.GracefulTimeout):
-		p.logger.Error("Worker pool stop timeout")
+		p.logger.Error("graceful timeout exceeded, forcing shutdown")
+		p.forceCancel()
+		<-done
 	}
 }
 
-// addTask submits a task to the pool for execution.
-// Returns an error if the pool is stopping or the queue is full.
+// addTask помещает задачу в очередь пула. Возвращает ошибку немедленно,
+// если пул останавливается или очередь заполнена (неблокирующий вызов).
 func (p *pool) addTask(task Task) error {
 	p.closeMu.RLock()
 	defer p.closeMu.RUnlock()
 
 	if p.stopping.Load() {
-		return fmt.Errorf("pool stopping")
+		return fmt.Errorf("pool is stopping")
 	}
 
 	select {
 	case p.taskChan <- task:
 		return nil
-
 	default:
-		return fmt.Errorf("task queue full")
+		return fmt.Errorf("pool queue full (capacity %d)", cap(p.taskChan))
 	}
 }
 
-// worker is the main processing loop for a pool worker.
-// It reads tasks from the channel and executes them.
+// worker — внутренний цикл одного воркера: читает задачи из taskChan
+// до его закрытия.
 func (p *pool) worker(id int) {
 	for task := range p.taskChan {
 		p.runTask(task, id)
 	}
 }
 
-// runTask executes a single task with panic recovery and completion callback.
-// This function guarantees that task.Complete is called exactly once.
+// runTask исполняет одну задачу с восстановлением после паники и гарантирует
+// единственный вызов Complete независимо от результата.
 func (p *pool) runTask(task Task, workerID int) {
+	var taskErr error
 	defer func() {
 		if r := recover(); r != nil {
-			p.logger.Error("Panic in task",
-				slog.Any("recover", r),
+			taskErr = fmt.Errorf("panic: %v", r)
+			p.logger.Error("task panic",
+				slog.String("tenant_id", task.TenantID.String()),
+				slog.String("task_id", task.TaskID.String()),
+				slog.Any("panic", r),
 				slog.String("stack", string(debug.Stack())))
 		}
-
-		// Guaranteed single execution of Complete callback.
 		if task.Complete != nil {
-			task.Complete()
+			task.Complete(taskErr)
 		}
 	}()
 
-	p.executeWithRetry(task, workerID)
+	taskErr = p.executeWithRetry(task, workerID)
 }
 
-// executeWithRetry attempts to execute a task with retries and exponential backoff.
-// It respects context cancellation and pool shutdown signals.
-func (p *pool) executeWithRetry(task Task, workerID int) {
-	ctxWithTrace := tracing.EnsureTraceID(task.Ctx)
+// executeWithRetry запускает Executor с повторными попытками и экспоненциальным
+// backoff. Контекст задачи объединяется с forceCtx пула: принудительная
+// остановка прерывает как паузу между попытками, так и сам вызов Execute
+// (при условии, что Executor соблюдает отмену контекста).
+//
+// OTel-span создаётся как дочерний относительно span'а, уже находящегося
+// в Task.Ctx. Если вызывающий код передал контекст с активным span'ом,
+// иерархия трассировки выстраивается автоматически.
+func (p *pool) executeWithRetry(task Task, workerID int) error {
+	// Создаём дочерний контекст, чтобы forceCancel не изменял контекст
+	// вызывающего кода.
+	taskCtx, taskCancel := context.WithCancel(task.Ctx)
+	defer taskCancel()
 
+	stopForce := context.AfterFunc(p.forceCtx, taskCancel)
+	defer stopForce()
+
+	// Span становится дочерним относительно span'а из task.Ctx (если он есть).
+	ctx, span := p.tracer.Start(taskCtx, "workerpool.task.execute",
+		trace.WithAttributes(
+			attribute.String("tenant.id", task.TenantID.String()),
+			attribute.String("task.id", task.TaskID.String()),
+			attribute.Int("worker.id", workerID),
+		))
+	defer span.End()
+
+	start := time.Now()
 	var lastErr error
-	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
-		err := task.Executor.Execute(ctxWithTrace, task.TenantID, workerID)
-		if err == nil {
-			return // Success
-		}
 
-		lastErr = err
+	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
+		span.SetAttributes(attribute.Int("attempt", attempt))
+
+		if err := task.Executor.Execute(ctx, task.TenantID, workerID); err == nil {
+			p.recordCompletion(task, time.Since(start), "success")
+			return nil
+		} else {
+			lastErr = err
+		}
 
 		if attempt == p.maxAttempts {
-			break // last attempt failed, no point sleeping before reporting
+			break
 		}
 
-		delay := backoff.CalculateExponentialBackoff(
+		delay := exponentialBackoff(
 			attempt,
 			p.config.RetryPolicy.Attempts.MinDelay,
 			p.config.RetryPolicy.Attempts.MaxDelay,
 		)
 
+		timer := time.NewTimer(delay)
 		select {
-		case <-time.After(delay):
-		case <-task.Ctx.Done():
-			return // Task cancelled
+		case <-timer.C:
+		case <-taskCtx.Done():
+			timer.Stop()
+			p.recordCompletion(task, time.Since(start), "cancelled")
+			return taskCtx.Err()
 		}
 	}
 
-	p.logger.Error("Task failed after retries",
+	p.logger.Error("task failed after all retries",
 		slog.String("tenant_id", task.TenantID.String()),
+		slog.String("task_id", task.TaskID.String()),
 		slog.Any("error", lastErr))
+
+	p.recordCompletion(task, time.Since(start), "failed")
+	return lastErr
+}
+
+// recordCompletion записывает OTel-метрики по завершении задачи.
+// status: "success" | "failed" | "cancelled".
+func (p *pool) recordCompletion(task Task, dur time.Duration, status string) {
+	attrs := metric.WithAttributes(
+		attribute.String("tenant.id", task.TenantID.String()),
+		attribute.String("status", status),
+	)
+	p.taskDuration.Record(context.Background(), dur.Seconds(), attrs)
+	p.tasksTotal.Add(context.Background(), 1, attrs)
+}
+
+// exponentialBackoff вычисляет задержку перед следующей попыткой.
+// Применяет полный jitter (случайное значение в [0, cap]) для предотвращения
+// thundering herd при одновременном сбое множества задач.
+func exponentialBackoff(attempt int, minDelay, maxDelay time.Duration) time.Duration {
+	if maxDelay <= 0 {
+		return 0
+	}
+	// Экспоненциальный рост: minDelay * 2^(attempt-1), не превышая maxDelay.
+	exp := minDelay
+	for i := 1; i < attempt; i++ {
+		next := exp * 2
+		if next > maxDelay || next < exp { // защита от переполнения int64
+			exp = maxDelay
+			break
+		}
+		exp = next
+	}
+	if exp <= 0 {
+		return 0
+	}
+	// Полный jitter: равномерное случайное значение в [0, exp).
+	return rand.N(exp)
 }

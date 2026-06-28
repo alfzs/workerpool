@@ -1,56 +1,116 @@
 package workerpool
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
-// Config holds all configuration parameters for the worker pool.
-// All fields have sensible defaults and can be overridden via YAML or environment variables.
+// Config содержит все настраиваемые параметры пула воркеров.
+// Нулевые значения недопустимы — всегда вызывайте Validate() перед
+// передачей конфига в NewWorkerManager.
 type Config struct {
-	// TaskQueueSize is the capacity of the global task queue.
-	// If the queue is full, additional tasks will be rejected with an error.
-	TaskQueueSize int `yaml:"task_queue_size" env-default:"100"`
+	// WorkerCount — количество горутин в глобальном пуле исполнения.
+	// Все тенанты разделяют эту ёмкость. Должно быть > 0.
+	WorkerCount int `yaml:"worker_count" env-default:"256"`
 
-	// GracefulTimeout is the maximum duration to wait for running tasks to complete
-	// during shutdown. After this timeout, remaining tasks are cancelled.
-	GracefulTimeout time.Duration `yaml:"graceful_timeout" env-default:"5m"`
+	// TaskQueueSize — ёмкость канала глобального пула.
+	// Задачи, поступающие при заполненном канале, отклоняются немедленно.
+	// Должно быть > 0.
+	TaskQueueSize int `yaml:"task_queue_size" env-default:"512"`
 
-	// TaskTimeout is the maximum execution time for a single task.
-	// Tasks exceeding this timeout are cancelled.
+	// TenantQueueSize — ёмкость буфера задач каждого тенанта.
+	// Устанавливается однократно при создании тенанта; не изменяется
+	// при обновлении лимита воркеров. Должно быть > 0.
+	TenantQueueSize int `yaml:"tenant_queue_size" env-default:"64"`
+
+	// GracefulTimeout — максимальное время ожидания завершения активных задач
+	// при вызове Stop(). По истечении таймаута все активные контексты задач
+	// принудительно отменяются. Должно быть > 0.
+	GracefulTimeout time.Duration `yaml:"graceful_timeout" env-default:"30s"`
+
+	// TaskTimeout — дедлайн по умолчанию для одного выполнения задачи.
+	// Вызывающий код может задать более жёсткий дедлайн через Task.Ctx.
+	// Должно быть > 0.
 	TaskTimeout time.Duration `yaml:"task_timeout" env-default:"5m"`
 
-	// RetryPolicy defines how failed tasks are retried.
-	RetryPolicy RetryPolicy `yaml:"retry_policy"`
+	// TenantRefreshInterval — как часто менеджер перезапрашивает список
+	// активных тенантов у TenantProvider. Должно быть > 0.
+	TenantRefreshInterval time.Duration `yaml:"tenant_refresh_interval" env-default:"30s"`
 
-	// WorkerCount defines the number of workers in the global pool for different priority levels.
-	WorkerCount int `yaml:"worker_count" env-default:"256"`
+	// RetryPolicy задаёт поведение при повторных попытках выполнения задачи.
+	// При использовании River как job store River управляет внешними ретраями;
+	// в этом случае установите Attempts.Count = 1.
+	RetryPolicy RetryPolicy `yaml:"retry_policy"`
 }
 
-// RetryPolicy defines how task execution retries are handled.
+// RetryPolicy определяет поведение при повторных попытках внутри пула.
 type RetryPolicy struct {
-	// Jitter configuration for initial task scheduling
+	// Jitter — случайная задержка перед самым первым выполнением задачи,
+	// используемая для размазывания нагрузки по кластеру.
 	Jitter JitterConfig `yaml:"jitter"`
 
-	// Attempts configures the retry behavior for failed tasks.
+	// Attempts — параметры повторных попыток при ошибках.
 	Attempts AttemptsConfig `yaml:"attempts"`
 }
 
-// JitterConfig defines the parameters for random delay before first execution.
+// JitterConfig определяет границы случайной задержки перед первым запуском.
 type JitterConfig struct {
-	// MinDelay is the minimum jitter duration
-	MinDelay time.Duration `yaml:"min_delay" env-default:"5s"`
+	// MinDelay — минимальная задержка jitter. Должно быть >= 0.
+	MinDelay time.Duration `yaml:"min_delay" env-default:"0s"`
 
-	// MaxDelay is the maximum jitter duration
-	MaxDelay time.Duration `yaml:"max_delay" env-default:"10s"`
+	// MaxDelay — максимальная задержка jitter. Должно быть >= MinDelay.
+	MaxDelay time.Duration `yaml:"max_delay" env-default:"5s"`
 }
 
-// AttemptsConfig defines the parameters for retry attempts.
+// AttemptsConfig определяет параметры повторных попыток.
 type AttemptsConfig struct {
-	// Count is the maximum number of execution attempts (including the first).
-	// If set to 3, a task will be tried up to 3 times before failing.
+	// Count — суммарное количество попыток, включая первую.
+	// При использовании River установите 1, чтобы не дублировать ретраи.
+	// Должно быть >= 1.
 	Count int `yaml:"count" env-default:"3"`
 
-	// MinDelay is the initial delay before the first retry.
+	// MinDelay — начальная пауза перед первой повторной попыткой.
 	MinDelay time.Duration `yaml:"min_delay" env-default:"1s"`
 
-	// MaxDelay is the maximum delay between retries (cap for exponential backoff).
-	MaxDelay time.Duration `yaml:"max_delay" env-default:"5s"`
+	// MaxDelay — верхняя граница экспоненциального backoff.
+	// Должно быть >= MinDelay.
+	MaxDelay time.Duration `yaml:"max_delay" env-default:"30s"`
+}
+
+// Validate проверяет корректность всех обязательных полей.
+// Возвращает объединённую ошибку со всеми нарушениями сразу, чтобы
+// вызывающий код мог вывести полный список проблем в одном сообщении.
+func (c Config) Validate() error {
+	var errs []error
+
+	if c.WorkerCount <= 0 {
+		errs = append(errs, fmt.Errorf("WorkerCount must be > 0, got %d", c.WorkerCount))
+	}
+	if c.TaskQueueSize <= 0 {
+		errs = append(errs, fmt.Errorf("TaskQueueSize must be > 0, got %d", c.TaskQueueSize))
+	}
+	if c.TenantQueueSize <= 0 {
+		errs = append(errs, fmt.Errorf("TenantQueueSize must be > 0, got %d", c.TenantQueueSize))
+	}
+	if c.GracefulTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("GracefulTimeout must be > 0, got %v", c.GracefulTimeout))
+	}
+	if c.TaskTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("TaskTimeout must be > 0, got %v", c.TaskTimeout))
+	}
+	if c.TenantRefreshInterval <= 0 {
+		errs = append(errs, fmt.Errorf("TenantRefreshInterval must be > 0, got %v", c.TenantRefreshInterval))
+	}
+	if c.RetryPolicy.Attempts.Count <= 0 {
+		errs = append(errs, fmt.Errorf("RetryPolicy.Attempts.Count must be >= 1, got %d", c.RetryPolicy.Attempts.Count))
+	}
+	if c.RetryPolicy.Attempts.MaxDelay < c.RetryPolicy.Attempts.MinDelay {
+		errs = append(errs, fmt.Errorf("RetryPolicy.Attempts.MaxDelay must be >= MinDelay"))
+	}
+	if c.RetryPolicy.Jitter.MaxDelay < c.RetryPolicy.Jitter.MinDelay {
+		errs = append(errs, fmt.Errorf("RetryPolicy.Jitter.MaxDelay must be >= MinDelay"))
+	}
+
+	return errors.Join(errs...)
 }

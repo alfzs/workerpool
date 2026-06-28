@@ -1,101 +1,107 @@
 /*
-Package workerpool provides a tenant-aware worker pool for executing tasks with per-tenant concurrency limits.
+Пакет workerpool реализует пул воркеров с изоляцией по тенантам, ограничением
+конкурентности на тенанта, трассировкой через OpenTelemetry и корректным
+graceful shutdown.
 
-# Overview
+# Компоненты
 
-WorkerPool manages task execution across multiple tenants, ensuring that each tenant gets its
-allocated share of workers and cannot exceed its concurrency limit. It consists of three main components:
+Пакет состоит из трёх взаимодействующих частей:
 
-1. WorkerManager - Per-tenant scheduling and concurrency control
-2. Pool - Global worker pool for actual task execution
-3. Task Registry - Registration and scheduling of periodic tasks
+  - WorkerManager — управление жизненным циклом тенантов и контроль
+    конкурентности через взвешенный семафор.
+  - Pool — общий пул горутин фиксированного размера: исполняет задачи,
+    снимает OTel-метрики и трассировку, реализует повторные попытки.
+  - ExecutorRegistry — сопоставляет строковые ключи (хранящиеся в job store)
+    с конкретными реализациями TaskExecutor.
 
-# Core Concepts
+Для персистентного планирования и multi-instance развёртывания пакет
+спроектирован под использование совместно с River (github.com/riverqueue/river)
+в роли job store. Полная схема интеграции описана в ARCHITECTURE.md.
 
-Tenant:
-  - Entities that require isolated task execution
-  - Each tenant has its own worker limit
-  - Tasks can be triggered per tenant
+# Быстрый старт
 
-Worker Limit:
-  - Maximum number of concurrent tasks per tenant
-  - Can be changed dynamically at runtime
-  - Enforced via semaphore pattern
-
-Task Execution:
-  - Tasks are first queued per tenant
-  - Tenant workers pull tasks and submit to global pool
-  - Global pool handles retries with exponential backoff
-  - Scheduled tasks can be registered for automatic execution
-
-# Usage Example
-
-	type MyTenant struct {
-		id    uuid.UUID
-		limit int
+	cfg := workerpool.Config{
+		WorkerCount:           64,
+		TaskQueueSize:         512,
+		TenantQueueSize:       32,
+		GracefulTimeout:       30 * time.Second,
+		TaskTimeout:           2 * time.Minute,
+		TenantRefreshInterval: 30 * time.Second,
+		RetryPolicy: workerpool.RetryPolicy{
+			Attempts: workerpool.AttemptsConfig{
+				Count:    3,
+				MinDelay: time.Second,
+				MaxDelay: 30 * time.Second,
+			},
+		},
 	}
 
-	func (t MyTenant) GetID() uuid.UUID { return t.id }
-	func (t MyTenant) GetWorkerLimit() int { return t.limit }
-
-	type MyExecutor struct{}
-
-	func (e MyExecutor) Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error {
-		// actual work here
-		return nil
+	// NewWorkerManager вызывает cfg.Validate() внутри.
+	manager, err := workerpool.NewWorkerManager(workerpool.WorkerManagerParams{
+		TenantProvider: myProvider, // реализует workerpool.TenantProvider
+		Config:         cfg,
+	})
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	func main() {
-		config := workerpool.Config{
-			TaskTimeout: 5 * time.Minute,
-			PoolSize: workerpool.PoolSize{Normal: 32},
-		}
+	if err := manager.Start(); err != nil {
+		log.Fatal(err)
+	}
+	defer manager.Stop()
 
-		manager, err := workerpool.NewWorkerManager(workerpool.WorkerManagerParams{
-			Logger:         slog.Default(),
-			TenantProvider: myProvider,
-			TaskExecutor:   &MyExecutor{},
-			Config:         config,
-		})
+	// Реестр executor'ов: ключи соответствуют полю ExecutorKey в job store.
+	registry := workerpool.NewExecutorRegistry()
+	registry.MustRegister("sync_orders", &SyncOrdersExecutor{})
 
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		manager.Start()
-		defer manager.Stop()
-
-		// Create task registry for scheduled tasks
-		registry := workerpool.NewTaskRegistry(manager)
-
-		// Register a periodic task
-		err = registry.RegisterTask(
-			uuid.New(),
-			"sync_orders",
-			5*time.Minute,
-			&MyExecutor{},
-			true, // enable jitter
-		)
-
-		// Trigger one-off task for specific tenant
-		manager.Trigger(tenantID)
+	// Разовая задача для конкретного тенанта.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	exec, _ := registry.Get("sync_orders")
+	err = manager.SubmitTask(tenantID, workerpool.Task{
+		Ctx:      ctx,
+		TaskID:   uuid.New(),
+		TenantID: tenantID,
+		Executor: exec,
+		Complete: func(err error) {
+			cancel()
+			if err != nil {
+				slog.Error("task failed", "error", err)
+			}
+		},
+	})
+	if err != nil {
+		cancel()
+		log.Println("submit failed:", err)
 	}
 
-# Concurrency Model
+# Модель конкурентности
 
-  - Per-tenant: N workers (where N = tenant limit)
-  - Global pool: M workers (configurable)
-  - Total concurrency = sum(tenant limits) but bounded by global pool size
+  - Глобальный пул: WorkerCount горутин, разделяемых между всеми тенантами.
+  - На тенанта: одна горутина-диспетчер и взвешенный семафор размером
+    Tenant.GetWorkerLimit(). Не более Limit задач тенанта выполняются
+    в пуле одновременно.
+  - Итоговая конкурентность ≤ min(сумма лимитов тенантов, WorkerCount).
 
-# Error Handling
+# Логирование и трассировка
 
-  - Panics are recovered at all levels
-  - Tasks are retried with exponential backoff
-  - Queue overflow leads to task drop with warning
-  - All errors are logged with context
+Логирование ведётся через slog.Default() — настройте глобальный логгер
+до вызова NewWorkerManager.
 
-# Thread Safety
+OTel-span создаётся вокруг каждого вызова Executor.Execute. Если Task.Ctx
+содержит активный span вызывающего кода (River worker, HTTP-обработчик),
+span пула автоматически становится его дочерним. Настройте глобальные
+провайдеры через otel.SetTracerProvider и otel.SetMeterProvider до старта
+менеджера; при отсутствии настройки используется noop-реализация.
 
-All public methods are safe for concurrent use.
+# Корректное завершение
+
+Stop() отменяет контексты обновлятора и всех диспетчеров, ожидает выхода
+горутин, затем останавливает пул. Пул сливает очередь в течение
+GracefulTimeout; по истечении — принудительно отменяет контексты всех
+активных задач.
+
+# Безопасность конкурентного доступа
+
+Все экспортированные методы безопасны для конкурентного использования.
 */
 package workerpool
