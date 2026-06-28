@@ -1,18 +1,18 @@
-# workerpool — Architecture
+# workerpool — Архитектура
 
-## Overview
+## Обзор
 
-`workerpool` is a tenant-aware execution engine designed for multi-instance
-deployments where tasks must run within per-tenant concurrency limits and
-survive process restarts.
+`workerpool` — движок исполнения задач с изоляцией по тенантам, спроектированный
+для multi-instance развёртывания, где задачи должны выполняться в рамках
+per-tenant лимитов конкурентности и переживать перезапуск процесса.
 
-The package deliberately handles **execution** only. Persistent scheduling,
-cron expressions, and multi-instance coordination are delegated to
-[River](https://github.com/riverqueue/river) — a Postgres-backed job queue.
+Пакет намеренно отвечает только за **исполнение**. Персистентное планирование,
+cron-выражения и координация между инстансами делегируются
+[River](https://github.com/riverqueue/river) — Postgres-backed job queue.
 
 ---
 
-## Component map
+## Карта компонентов
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -20,102 +20,102 @@ cron expressions, and multi-instance coordination are delegated to
 │  river_jobs { id, kind, args, cron, state, tenant_id, … }  │
 └──────────────┬──────────────────────────────────────────────┘
                │  SELECT … FOR UPDATE SKIP LOCKED
-               │  (multi-instance safe; leader election for cron)
+               │  (безопасно для нескольких инстансов; leader election для cron)
 ┌──────────────▼──────────────────────────────────────────────┐
 │                         River                                │
-│  • PeriodicJob  – cron scheduling stored in Postgres         │
-│  • InsertMany   – fan-out: one job per active tenant         │
-│  • UniqueOpts   – prevents duplicate jobs per tenant         │
-│  • Dead-letter  – failed jobs after max retries              │
+│  • PeriodicJob  — cron-расписание хранится в Postgres        │
+│  • InsertMany   — fan-out: по одному job на каждого тенанта  │
+│  • UniqueOpts   — защита от дублирования job по тенанту      │
+│  • Dead-letter  — упавшие job после исчерпания попыток       │
 └──────────────┬──────────────────────────────────────────────┘
                │  river.Worker.Work() → WorkerManager.SubmitTask()
 ┌──────────────▼──────────────────────────────────────────────┐
 │                     WorkerManager                            │
 │  tenants: map[uuid]*tenantState                              │
 │    tenantState:                                              │
-│      taskQueue  chan Task   (TenantQueueSize buffer)         │
+│      taskQueue  chan Task   (буфер TenantQueueSize)          │
 │      sem        *semaphore.Weighted  (= WorkerLimit)         │
-│      dispatcher 1 goroutine                                  │
-│  TenantProvider → refreshed every TenantRefreshInterval      │
+│      dispatcher 1 горутина                                   │
+│  TenantProvider → обновляется каждые TenantRefreshInterval   │
 └──────────────┬──────────────────────────────────────────────┘
                │  pool.addTask()
 ┌──────────────▼──────────────────────────────────────────────┐
 │                          Pool                                │
-│  WorkerCount goroutines                                      │
-│  OTel tracing (span per Execute call)                        │
-│  OTel metrics (duration histogram, completion counter)       │
-│  Exponential backoff retry (configurable)                    │
-│  Panic recovery + worker restart                             │
-│  GracefulTimeout → forceCancel on context propagation        │
+│  WorkerCount горутин                                         │
+│  OTel-трассировка (span на каждый вызов Execute)             │
+│  OTel-метрики (гистограмма длительности, счётчик завершений) │
+│  Повторные попытки с экспоненциальным backoff                │
+│  Восстановление после паники + перезапуск воркера            │
+│  GracefulTimeout → forceCancel с распространением в контексты│
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Concurrency model
+## Модель конкурентности
 
-| Layer | Goroutines | Purpose |
+| Уровень | Горутины | Назначение |
 |---|---|---|
-| Pool | `WorkerCount` (fixed) | Execute tasks |
-| Tenant dispatcher | 1 per active tenant | Enforce per-tenant limit via semaphore |
-| Tenant refresh | 1 | Periodically sync TenantProvider |
+| Pool | `WorkerCount` (фиксировано) | Исполнение задач |
+| Диспетчер тенанта | 1 на активного тенанта | Соблюдение лимита через семафор |
+| Обновлятор тенантов | 1 | Периодическая синхронизация с TenantProvider |
 
-At most `WorkerLimit` tasks per tenant run in the pool simultaneously.
-The dispatcher blocks on `sem.Acquire` until a slot is free, then immediately
-releases itself from the queue — it does not consume a pool slot while waiting.
+Одновременно в пуле выполняется не более `WorkerLimit` задач одного тенанта.
+Диспетчер блокируется на `sem.Acquire` до освобождения слота и не занимает
+слот пула в ожидании.
 
-**Goroutine budget example** — 200 tenants, `WorkerCount=256`:
+**Бюджет горутин** — 200 тенантов, `WorkerCount=256`:
 
-| Component | Goroutines |
+| Компонент | Горутины |
 |---|---|
-| Pool workers | 256 |
-| Tenant dispatchers | 200 |
-| Refresher | 1 |
-| **Total** | **457** |
+| Воркеры пула | 256 |
+| Диспетчеры тенантов | 200 |
+| Обновлятор | 1 |
+| **Итого** | **457** |
 
-This replaces the previous design (N blocking goroutines per tenant) which
-would have required up to 200 × avg_limit goroutines for dispatchers alone.
+Это замена прежней схемы (N блокирующих горутин на тенанта), которая требовала
+до 200 × avg_limit горутин только для диспетчеров.
 
 ---
 
-## Task lifecycle
+## Жизненный цикл задачи
 
 ```
-Caller / River Worker
+Вызывающий код / River Worker
     │
     ▼ SubmitTask()
-tenant.taskQueue  ──(buffered chan)──►  dispatcher goroutine
-                                              │
-                                        sem.Acquire()   ← blocks if at limit
-                                              │
-                                        pool.addTask()
-                                              │
-                                    pool worker goroutine
-                                              │
-                                    Executor.Execute()  ← OTel span
-                                              │ (retry on error)
-                                    task.Complete(err)
-                                              │
-                                        sem.Release()
-                                              │
-                                    River Worker unblocks
-                                        (returns nil/err to River)
+tenant.taskQueue  ──(буферизованный chan)──►  горутина-диспетчер
+                                                      │
+                                              sem.Acquire()   ← блокируется при исчерпании лимита
+                                                      │
+                                              pool.addTask()
+                                                      │
+                                          горутина-воркер пула
+                                                      │
+                                          Executor.Execute()  ← OTel span
+                                                      │ (повтор при ошибке)
+                                          task.Complete(err)
+                                                      │
+                                              sem.Release()
+                                                      │
+                                          River Worker разблокируется
+                                              (возвращает nil/err в River)
 ```
 
 ---
 
-## Dispatch modes
+## Режимы диспетчеризации
 
-Two task dispatch patterns are supported at the **River / application** layer:
+На уровне **River / приложения** поддерживаются два паттерна запуска задач.
 
-### AllTenants (broadcast)
+### AllTenants (широковещательный)
 
-A cron job fans out one River job per active tenant.
-River's leader election ensures the fan-out runs exactly once per period
-across all instances.
+Cron-job выполняет fan-out: вставляет по одному River job на каждого активного
+тенанта. Leader election River гарантирует, что fan-out выполняется ровно один
+раз за период на весь кластер.
 
 ```go
-// Fan-out River worker — runs per cron, inserts one job per tenant.
+// Fan-out River worker — запускается по cron, вставляет по одному job на тенанта.
 type FanOutWorker struct {
     riverClient *river.Client[pgx.Tx]
     manager     *workerpool.WorkerManager
@@ -142,7 +142,7 @@ func (w *FanOutWorker) Work(ctx context.Context, job *river.Job[FanOutArgs]) err
     return err
 }
 
-// Register as a periodic job (cron).
+// Регистрация как periodic job (cron).
 river.NewPeriodicJob(
     river.PeriodicInterval(20 * time.Second),
     func() (river.JobArgs, *river.InsertOpts) {
@@ -152,44 +152,44 @@ river.NewPeriodicJob(
 )
 ```
 
-### OneTenant (targeted)
+### OneTenant (адресный)
 
-Insert a single River job with the target `TenantID` in args.
-Works from any context: HTTP handler, event consumer, another worker.
+Вставка одного River job с целевым `TenantID` в args. Работает из любого
+контекста: HTTP-обработчика, консьюмера событий, другого воркера.
 
 ```go
-// From an HTTP handler (within a business transaction):
+// Из HTTP-обработчика (в рамках бизнес-транзакции):
 _, err := riverClient.InsertTx(ctx, tx, SyncOrdersArgs{TenantID: tenantID}, nil)
 ```
 
 ---
 
-## Preventing duplicate execution (UniqueOpts)
+## Защита от дублирования (UniqueOpts)
 
-For tasks where duplicate execution causes business failures, use River's
-`UniqueOpts` to enforce at-most-one-in-flight per tenant:
+Для задач, где повторное выполнение влечёт бизнес-сбой, используйте
+`UniqueOpts` River для ограничения «не более одного активного job на тенанта»:
 
 ```go
 InsertOpts: &river.InsertOpts{
     UniqueOpts: river.UniqueOpts{
-        ByArgs:  true,   // uniqueness key = hash of job args (incl. TenantID)
+        ByArgs:  true,   // ключ уникальности = хэш args (включая TenantID)
         ByState: []rivertype.JobState{
             rivertype.JobStateAvailable,
             rivertype.JobStateRunning,
         },
-        // No ByPeriod = unique for as long as the job is in those states.
+        // Без ByPeriod — уникальность действует, пока job в этих состояниях.
     },
 },
 ```
 
-Guarantee chain:
-1. **River leader election** — fan-out executes once per period across instances.
-2. **UniqueOpts** — at most one job per tenant in `available` or `running` state.
-3. **WorkerManager semaphore** — at most `WorkerLimit` concurrent executions per tenant in the pool.
+Цепочка гарантий:
+1. **Leader election River** — fan-out выполняется ровно один раз за период на весь кластер.
+2. **UniqueOpts** — не более одного job на тенанта в состоянии `available` или `running`.
+3. **Семафор WorkerManager** — не более `WorkerLimit` одновременных выполнений тенанта в пуле.
 
 ---
 
-## River worker integration pattern
+## Паттерн интеграции River worker
 
 ```go
 type SyncOrdersWorker struct {
@@ -213,87 +213,87 @@ func (w *SyncOrdersWorker) Work(ctx context.Context, job *river.Job[SyncOrdersAr
         Complete: func(err error) { done <- err },
     })
     if err != nil {
-        return err // River will retry
+        return err // River повторит попытку
     }
 
     select {
     case err := <-done:
-        return err // nil → River marks complete; non-nil → River retries
+        return err // nil → River помечает job выполненным; non-nil → River ретраит
     case <-ctx.Done():
         return ctx.Err()
     }
 }
 ```
 
-When using River for retries, set `RetryPolicy.Attempts.Count = 1` in the
-workerpool Config to avoid double-retry.
+При использовании River для повторных попыток установите
+`RetryPolicy.Attempts.Count = 1` в Config пула, чтобы избежать двойного retry.
 
 ---
 
 ## OpenTelemetry
 
-The pool emits the following instruments under the `workerpool` meter/tracer:
+Пул эмитирует следующие инструменты под именем `workerpool`:
 
-| Type | Name | Labels |
+| Тип | Имя | Метки |
 |---|---|---|
 | `Float64Histogram` | `workerpool.task.duration` | `tenant.id`, `status` |
 | `Int64Counter` | `workerpool.tasks.total` | `tenant.id`, `status` |
 | `Span` | `workerpool.task.execute` | `tenant.id`, `task.id`, `worker.id`, `attempt` |
 
-`status` is one of `success`, `failed`, `cancelled`.
+`status` принимает значения `success`, `failed`, `cancelled`.
 
-Providers are injected via `WorkerManagerParams.TracerProvider` and
-`WorkerManagerParams.MeterProvider`. When nil, the global OTel providers are
-used (noop unless the application configures them).
+Провайдеры берутся из глобальных OTel-провайдеров: настройте
+`otel.SetTracerProvider` и `otel.SetMeterProvider` до старта менеджера.
+При отсутствии настройки используется noop-реализация.
 
 ---
 
-## Configuration reference
+## Справочник конфигурации
 
-| Field | Default | Description |
+| Поле | По умолчанию | Описание |
 |---|---|---|
-| `WorkerCount` | 256 | Global pool goroutines |
-| `TaskQueueSize` | 512 | Global pool channel buffer |
-| `TenantQueueSize` | 64 | Per-tenant channel buffer |
-| `GracefulTimeout` | 30s | Max wait before force-cancel on Stop() |
-| `TaskTimeout` | 5m | Default task context deadline |
-| `TenantRefreshInterval` | 30s | How often TenantProvider is polled |
-| `RetryPolicy.Attempts.Count` | 3 | Max attempts per task (set to 1 with River) |
-| `RetryPolicy.Attempts.MinDelay` | 1s | Initial retry backoff |
-| `RetryPolicy.Attempts.MaxDelay` | 30s | Max retry backoff |
+| `WorkerCount` | 256 | Горутины глобального пула |
+| `TaskQueueSize` | 512 | Буфер канала глобального пула |
+| `TenantQueueSize` | 64 | Буфер канала на тенанта |
+| `GracefulTimeout` | 30s | Максимальное ожидание до force-cancel при Stop() |
+| `TaskTimeout` | 5m | Дедлайн задачи по умолчанию |
+| `TenantRefreshInterval` | 30s | Период опроса TenantProvider |
+| `RetryPolicy.Attempts.Count` | 3 | Максимум попыток (установите 1 при использовании River) |
+| `RetryPolicy.Attempts.MinDelay` | 1s | Начальная пауза backoff |
+| `RetryPolicy.Attempts.MaxDelay` | 30s | Максимальная пауза backoff |
 
-All values are validated by `Config.Validate()`, which is called inside
+Все значения валидируются через `Config.Validate()`, который вызывается внутри
 `NewWorkerManager`.
 
 ---
 
-## Graceful shutdown sequence
+## Последовательность graceful shutdown
 
 ```
 WorkerManager.Stop()
     │
     ├─ stopping = true
-    ├─ cancel manager ctx          → stops tenantRefresher goroutine
-    ├─ cancel all tenant ctxs      → stops all dispatcher goroutines
-    ├─ wg.Wait()                   → wait for all dispatchers + refresher
+    ├─ отмена контекста менеджера    → останавливает горутину tenantRefresher
+    ├─ отмена контекстов тенантов    → останавливает все горутины-диспетчеры
+    ├─ wg.Wait()                     → ожидание завершения диспетчеров и обновлятора
     │
     └─ pool.stop()
-        ├─ close(taskChan)         → workers drain remaining tasks
-        ├─ wait up to GracefulTimeout
-        └─ [on timeout] forceCancel() → propagates into all task contexts
-                        wg.Wait()     → wait for all pool goroutines
+        ├─ close(taskChan)           → воркеры вычитывают оставшиеся задачи
+        ├─ ожидание до GracefulTimeout
+        └─ [по таймауту] forceCancel() → распространяется в контексты всех задач
+                         wg.Wait()     → ожидание завершения всех горутин пула
 ```
 
 ---
 
-## Operational checklist for production
+## Чеклист для продакшена
 
-- [ ] Configure OTel `MeterProvider` and `TracerProvider` (Prometheus / Jaeger / OTLP).
-- [ ] Wire `WorkerManager.Health()` to `/healthz` and `/readyz` endpoints.
-- [ ] Set `UniqueOpts` on all tasks where duplicate execution is harmful.
-- [ ] Set `RetryPolicy.Attempts.Count = 1` when River handles outer retries.
-- [ ] Size `WorkerCount` ≥ expected peak concurrent tasks across all tenants.
-- [ ] Size `TenantQueueSize` to absorb burst submissions without dropping tasks.
-- [ ] Monitor `workerpool.task.duration` P95/P99 for latency regressions.
-- [ ] Monitor `workerpool.tasks.total{status="failed"}` for error rate alerting.
-- [ ] Monitor `HealthStatus.PoolQueueDepth` / `PoolQueueCapacity` ratio for backpressure.
+- [ ] Настроить OTel `MeterProvider` и `TracerProvider` (Prometheus / Jaeger / OTLP).
+- [ ] Подключить `WorkerManager.Health()` к эндпоинтам `/healthz` и `/readyz`.
+- [ ] Установить `UniqueOpts` для всех задач, где дублирование недопустимо.
+- [ ] Установить `RetryPolicy.Attempts.Count = 1`, если повторными попытками управляет River.
+- [ ] `WorkerCount` ≥ ожидаемого пикового числа одновременных задач по всем тенантам.
+- [ ] `TenantQueueSize` должен поглощать всплески без потери задач.
+- [ ] Мониторить `workerpool.task.duration` P95/P99 для выявления деградации.
+- [ ] Мониторить `workerpool.tasks.total{status="failed"}` для алертинга по ошибкам.
+- [ ] Мониторить соотношение `HealthStatus.PoolQueueDepth / PoolQueueCapacity` для обнаружения backpressure.
