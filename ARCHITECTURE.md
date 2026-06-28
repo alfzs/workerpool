@@ -230,6 +230,298 @@ func (w *SyncOrdersWorker) Work(ctx context.Context, job *river.Job[SyncOrdersAr
 
 ---
 
+## Полный пример интеграции с River
+
+Сквозной пример: от миграций и определения типов до запуска и graceful shutdown.
+
+### Зависимости
+
+```bash
+go get github.com/riverqueue/river
+go get github.com/riverqueue/river/riverdriver/riverpgxv5
+go get github.com/jackc/pgx/v5
+```
+
+### Миграции
+
+River хранит всё состояние в Postgres. Миграции прогоняются один раз до старта
+приложения — при повторном запуске они идемпотентны.
+
+```go
+import (
+    "github.com/riverqueue/river/riverdriver/riverpgxv5"
+    "github.com/riverqueue/river/rivermigrate"
+)
+
+func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
+    migrator, err := rivermigrate.New(riverpgxv5.New(pool), nil)
+    if err != nil {
+        return err
+    }
+    _, err = migrator.Migrate(ctx, rivermigrate.DirectionUp, nil)
+    return err
+}
+```
+
+### Типы job
+
+Каждый тип задачи — отдельная структура, реализующая `river.JobArgs`.
+Метод `Kind()` возвращает строку, используемую также как ключ в `ExecutorRegistry`.
+
+```go
+// SyncOrdersArgs — аргументы задачи синхронизации заказов конкретного тенанта.
+type SyncOrdersArgs struct {
+    TenantID uuid.UUID `json:"tenant_id"`
+}
+
+func (SyncOrdersArgs) Kind() string { return "sync_orders" }
+
+// FanOutArgs — триггер для режима AllTenants: один job запускает fan-out.
+type FanOutArgs struct {
+    JobKind string `json:"job_kind"`
+}
+
+func (FanOutArgs) Kind() string { return "fan_out" }
+```
+
+### Реализация TaskExecutor
+
+Бизнес-логика инкапсулирована в `TaskExecutor`. River и workerpool о ней не знают.
+
+```go
+type SyncOrdersExecutor struct {
+    db  *pgxpool.Pool
+    api *OrdersAPIClient
+}
+
+func (e *SyncOrdersExecutor) Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error {
+    orders, err := e.api.FetchPending(ctx, tenantID)
+    if err != nil {
+        return fmt.Errorf("fetch orders: %w", err)
+    }
+    return e.db.SaveOrders(ctx, tenantID, orders)
+}
+```
+
+### River Worker — адаптер к workerpool
+
+River Worker — тонкий слой: получает job из Postgres, передаёт в workerpool,
+блокируется до получения результата. Ошибка из `done` возвращается в River,
+который принимает решение о повторной попытке.
+
+```go
+type SyncOrdersWorker struct {
+    manager  *workerpool.WorkerManager
+    registry *workerpool.ExecutorRegistry
+}
+
+func (w *SyncOrdersWorker) Work(ctx context.Context, job *river.Job[SyncOrdersArgs]) error {
+    exec, err := w.registry.Get(job.Args.Kind())
+    if err != nil {
+        // Executor не зарегистрирован — программная ошибка, не ретраить.
+        return river.JobCancel(err)
+    }
+
+    done := make(chan error, 1)
+
+    err = w.manager.SubmitTask(job.Args.TenantID, workerpool.Task{
+        Ctx:      ctx, // контекст River: несёт таймаут и OTel-span вызывающего кода
+        TaskID:   uuid.New(),
+        TenantID: job.Args.TenantID,
+        Executor: exec,
+        Complete: func(err error) { done <- err },
+    })
+    if err != nil {
+        // Очередь тенанта заполнена или тенант неизвестен — River повторит позже.
+        return fmt.Errorf("submit task: %w", err)
+    }
+
+    select {
+    case taskErr := <-done:
+        return taskErr // nil → job выполнен; non-nil → River ретраит
+    case <-ctx.Done():
+        // River останавливается или истёк JobTimeout.
+        // Job возвращается в очередь со статусом retryable.
+        return ctx.Err()
+    }
+}
+```
+
+### Fan-out Worker (режим AllTenants)
+
+Fan-out Worker запускается по cron и вставляет по одному job на каждого активного
+тенанта. `UniqueOpts` гарантирует, что если предыдущий job тенанта ещё не
+завершился — новый молча игнорируется.
+
+```go
+type FanOutWorker struct {
+    riverClient *river.Client[pgx.Tx]
+    manager     *workerpool.WorkerManager
+}
+
+func (w *FanOutWorker) Work(ctx context.Context, job *river.Job[FanOutArgs]) error {
+    tenants := w.manager.GetActiveTenants()
+    if len(tenants) == 0 {
+        return nil
+    }
+
+    batch := make([]river.InsertManyParams, len(tenants))
+    for i, tid := range tenants {
+        batch[i] = river.InsertManyParams{
+            Args: SyncOrdersArgs{TenantID: tid},
+            InsertOpts: &river.InsertOpts{
+                UniqueOpts: river.UniqueOpts{
+                    ByArgs:  true,
+                    ByState: []rivertype.JobState{
+                        rivertype.JobStateAvailable,
+                        rivertype.JobStateRunning,
+                    },
+                },
+            },
+        }
+    }
+
+    _, err := w.riverClient.InsertMany(ctx, batch)
+    return err
+}
+```
+
+### Сборка в main
+
+```go
+func main() {
+    ctx := context.Background()
+
+    // База данных.
+    dbPool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer dbPool.Close()
+
+    // Миграции River — идемпотентны при повторных запусках.
+    if err := runMigrations(ctx, dbPool); err != nil {
+        log.Fatal(err)
+    }
+
+    // Реестр executor'ов: ключи соответствуют Kind() типов job.
+    registry := workerpool.NewExecutorRegistry()
+    registry.MustRegister("sync_orders", &SyncOrdersExecutor{
+        db:  dbPool,
+        api: newOrdersAPIClient(),
+    })
+
+    // WorkerManager: RetryPolicy.Attempts.Count = 1, т.к. River управляет retry.
+    manager, err := workerpool.NewWorkerManager(workerpool.WorkerManagerParams{
+        TenantProvider: NewPostgresTenantProvider(dbPool),
+        Config: workerpool.Config{
+            WorkerCount:           256,
+            TaskQueueSize:         512,
+            TenantQueueSize:       32,
+            GracefulTimeout:       30 * time.Second,
+            TaskTimeout:           2 * time.Minute,
+            TenantRefreshInterval: 30 * time.Second,
+            RetryPolicy: workerpool.RetryPolicy{
+                Attempts: workerpool.AttemptsConfig{Count: 1},
+            },
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Клиент River только для вставки job (без воркеров) — нужен FanOutWorker'у.
+    insertClient, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Регистрация воркеров River.
+    workers := river.NewWorkers()
+    river.AddWorker(workers, &SyncOrdersWorker{manager: manager, registry: registry})
+    river.AddWorker(workers, &FanOutWorker{riverClient: insertClient, manager: manager})
+
+    // Основной клиент River: воркеры + очереди + cron.
+    //
+    // MaxWorkers должен быть >= WorkerCount пула: каждый Work() блокируется
+    // до завершения задачи, поэтому River нужно столько же слотов, сколько
+    // задач может одновременно выполняться в пуле.
+    riverClient, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{
+        Workers: workers,
+        Queues: map[string]river.QueueConfig{
+            river.QueueDefault: {MaxWorkers: 256},
+        },
+        PeriodicJobs: []*river.PeriodicJob{
+            river.NewPeriodicJob(
+                river.PeriodicInterval(20*time.Second),
+                func() (river.JobArgs, *river.InsertOpts) {
+                    return FanOutArgs{JobKind: "sync_orders"}, nil
+                },
+                &river.PeriodicJobOpts{RunOnStart: true},
+            ),
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Старт.
+    if err := manager.Start(); err != nil {
+        log.Fatal(err)
+    }
+    if err := riverClient.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
+
+    // Graceful shutdown по сигналу ОС.
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+    <-quit
+
+    // 1. Останавливаем River: ждёт завершения активных Work() вызовов.
+    //    Work() разблокируется через done-канал или по ctx.Done().
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+    defer cancel()
+    if err := riverClient.Stop(shutdownCtx); err != nil {
+        slog.Error("river stop", "error", err)
+    }
+
+    // 2. Останавливаем workerpool: сливает очередь, при необходимости force-cancel.
+    manager.Stop()
+}
+```
+
+### Адресный запуск (режим OneTenant)
+
+Из любого места приложения — HTTP-обработчика, gRPC, Kafka-консьюмера:
+
+```go
+// Вне транзакции:
+_, err := riverClient.Insert(ctx, SyncOrdersArgs{TenantID: tenantID}, &river.InsertOpts{
+    UniqueOpts: river.UniqueOpts{
+        ByArgs:  true,
+        ByState: []rivertype.JobState{
+            rivertype.JobStateAvailable,
+            rivertype.JobStateRunning,
+        },
+    },
+})
+
+// Внутри бизнес-транзакции (атомарно с изменением данных):
+// Если транзакция откатится — job не появится в очереди.
+_, err = riverClient.InsertTx(ctx, tx, SyncOrdersArgs{TenantID: tenantID}, &river.InsertOpts{
+    UniqueOpts: river.UniqueOpts{
+        ByArgs:  true,
+        ByState: []rivertype.JobState{
+            rivertype.JobStateAvailable,
+            rivertype.JobStateRunning,
+        },
+    },
+})
+```
+
+---
+
 ## OpenTelemetry
 
 Пул эмитирует следующие инструменты под именем `workerpool`:
