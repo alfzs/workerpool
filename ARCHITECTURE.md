@@ -578,6 +578,117 @@ WorkerManager.Stop()
 
 ---
 
+## Тесты
+
+### Структура тестов
+
+Тесты находятся в том же пакете `workerpool` (white-box), что даёт доступ к
+неэкспортированным методам — в частности, к `refreshTenants()` для
+детерминированного тестирования жизненного цикла тенантов без ожидания тикера.
+
+| Файл | Что тестирует |
+|---|---|
+| `config_test.go` | `Config.Validate()` — все поля, комбинации нарушений |
+| `executor_registry_test.go` | `ExecutorRegistry` — Register, Get, MustRegister, Keys, конкурентный доступ |
+| `manager_test.go` | `WorkerManager` — изоляция тенантов, инварианты Complete, lifecycle |
+| `helpers_test.go` | Вспомогательные моки и фабрики, используемые во всех тестах |
+
+### Описание тестов
+
+**Изоляция тенантов** — ключевые тесты для продакшена:
+
+| Тест | Что проверяет |
+|---|---|
+| `TestTenantConcurrencyLimit` | Семафор блокирует (limit+1)-ю задачу; ровно `WorkerLimit` задач выполняются одновременно |
+| `TestTenantIsolation` | Занятый семафор тенанта A не задерживает задачи тенанта B |
+| `TestMultipleTenantsConcurrent` | 8 тенантов отправляют задачи параллельно без взаимной блокировки |
+
+**Инвариант Complete:**
+
+| Тест | Что проверяет |
+|---|---|
+| `TestCompleteCalledExactlyOnce` | `Complete` вызывается ровно 1 раз при успехе, ошибке и панике executor'а |
+
+**Устойчивость пула:**
+
+| Тест | Что проверяет |
+|---|---|
+| `TestPanicDoesNotKillPool` | После паники в `Execute` воркер перезапускается; пул продолжает работу |
+| `TestStopDoesNotDeadlock` | `Stop()` возвращается после `GracefulTimeout` даже при заблокированных задачах |
+| `TestStopIdempotent` | Повторный `Stop()` безопасен и не блокирует |
+
+**Lifecycle тенантов:**
+
+| Тест | Что проверяет |
+|---|---|
+| `TestRefreshTenantsAddTenant` | После добавления тенанта через провайдер `SubmitTask` начинает принимать задачи |
+| `TestRefreshTenantsRemoveTenant` | После удаления тенанта `SubmitTask` возвращает ошибку |
+| `TestRefreshTenantsUpdateLimit` | После увеличения `WorkerLimit` новое число задач выполняется одновременно |
+
+**Прочие инварианты:**
+
+| Тест | Что проверяет |
+|---|---|
+| `TestTaskRetryOnError` | `RetryPolicy.Attempts.Count` — точное число повторных попыток |
+| `TestContextCancellationPropagated` | Отмена `Task.Ctx` доходит до `Executor.Execute` |
+| `TestTenantQueueFull` | `SubmitTask` немедленно возвращает ошибку при заполненном буфере тенанта |
+| `TestConfigValidate` | Все поля конфига, объединение нескольких ошибок через `errors.Join` |
+| `TestExecutorRegistry_ConcurrentAccess` | Параллельные `Register`/`Get` без гонок |
+
+### Запуск тестов
+
+Базовый запуск:
+
+```bash
+go test ./...
+```
+
+С детектором гонок (обязательно перед мержем):
+
+```bash
+go test -race ./...
+```
+
+Конкретный тест:
+
+```bash
+go test -race -run TestTenantIsolation ./...
+```
+
+Группа тестов по префиксу:
+
+```bash
+go test -race -run TestTenant ./...
+go test -race -run TestRefreshTenants ./...
+```
+
+Подробный вывод:
+
+```bash
+go test -race -v ./...
+```
+
+С увеличенным таймаутом (для медленных окружений):
+
+```bash
+go test -race -timeout 120s ./...
+```
+
+### Замечания по тестовой инфраструктуре
+
+- **Нет реального Postgres.** Тесты не требуют внешних зависимостей: `TenantProvider`
+  заменён `mockTenantProvider`, `TaskExecutor` — `mockExecutor`.
+- **Нет `time.Sleep` как синхронизации**, кроме `TestTenantQueueFull` (30 мс),
+  где нужно дать диспетчеру время заблокироваться на `sem.Acquire`.
+  Все остальные тесты используют каналы и `sync.WaitGroup`.
+- **OTel.** Глобальные провайдеры не инициализируются в тестах — используется
+  noop-реализация из `go.opentelemetry.io/otel`, которая не возвращает ошибок
+  и не требует настройки.
+- **`refreshTenants()` вызывается напрямую** в тестах lifecycle, минуя тикер
+  `TenantRefreshInterval`. Это делает тесты детерминированными и быстрыми.
+
+---
+
 ## Чеклист для продакшена
 
 - [ ] Настроить OTel `MeterProvider` и `TracerProvider` (Prometheus / Jaeger / OTLP).
