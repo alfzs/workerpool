@@ -63,10 +63,13 @@ type TaskExecutor interface {
 //
 // Семафор (sem) ограничивает количество задач тенанта, одновременно
 // выполняемых в глобальном пуле. При каждом вызове setWorkerCount создаётся
-// новый sem; старый диспетчер освобождает слоты старого sem через Complete-
-// коллбэки по мере завершения задач — конфликтов между поколениями нет.
+// новый sem, но перед этим setWorkerCount синхронно дожидается genDone —
+// полного завершения диспетчера предыдущего поколения. Инвариант: не более
+// одного диспетчера на тенант одновременно читает из taskQueue (см.
+// docs/CONCURRENCY_AUDIT.md, находка №1 — до этого инварианта диспетчер
+// уходящего поколения мог гонково перехватить задачу нового поколения).
 //
-// Изменяемые поля (limit, sem, genCancel) изменяются только под
+// Изменяемые поля (limit, sem, genCancel, genDone) изменяются только под
 // tenantsMu менеджера.
 type tenantState struct {
 	id        uuid.UUID
@@ -75,6 +78,7 @@ type tenantState struct {
 	limit     int
 	sem       *semaphore.Weighted
 	genCancel context.CancelFunc
+	genDone   chan struct{}
 
 	ctx    context.Context //nolint:containedctx // lifecycle context scoping this tenant's dispatcher goroutine, not a per-call context
 	cancel context.CancelFunc
@@ -391,10 +395,17 @@ func (w *WorkerManager) createTenant(id uuid.UUID, limit int) {
 }
 
 // setWorkerCount перезапускает диспетчер тенанта с семафором нового размера.
-// Предыдущий диспетчер (если есть) отменяется через genCancel: он завершается
-// после того, как текущий Acquire возвращает ошибку, а слоты семафора
-// старого поколения освобождаются через Complete-коллбэки активных задач.
-// Задачи в глобальном пуле при этом не прерываются.
+// Предыдущий диспетчер (если есть) отменяется через genCancel, после чего
+// setWorkerCount синхронно дожидается genDone — полного выхода диспетчера
+// предыдущего поколения — и только затем поднимает новый. Это гарантирует,
+// что из state.taskQueue в любой момент читает не более одного диспетчера:
+// без этого ожидания диспетчер уходящего поколения мог по гонке (select
+// недетерминирован между готовыми кейсами) перехватить задачу, адресованную
+// новому поколению, и немедленно завершить её с ErrDispatcherStopped вместо
+// выполнения под новым лимитом (см. docs/CONCURRENCY_AUDIT.md, находка №1).
+// Ожидание ограничено по времени: dispatch не содержит блокирующих вызовов,
+// не учитывающих genCtx, поэтому предыдущий диспетчер завершается практически
+// сразу после genCancel(). Задачи в глобальном пуле при этом не прерываются.
 //
 // Вызывается под tenantsMu.
 func (w *WorkerManager) setWorkerCount(state *tenantState, limit int) {
@@ -404,17 +415,25 @@ func (w *WorkerManager) setWorkerCount(state *tenantState, limit int) {
 
 	if state.genCancel != nil {
 		state.genCancel()
+		<-state.genDone
 	}
 
 	genCtx, genCancel := context.WithCancel(state.ctx)
 	sem := semaphore.NewWeighted(int64(limit))
+	done := make(chan struct{})
 
 	state.sem = sem
 	state.genCancel = genCancel
+	state.genDone = done
 	state.limit = limit
 
 	w.wg.Add(1)
-	go w.dispatch(genCtx, state, sem)
+
+	go func() {
+		defer close(done)
+
+		w.dispatch(genCtx, state, sem)
+	}()
 }
 
 // dispatch — единственная горутина-диспетчер на тенанта, обеспечивающая

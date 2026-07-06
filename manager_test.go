@@ -861,6 +861,86 @@ func TestRefreshTenantsUpdateLimit(t *testing.T) {
 	wg.Wait()
 }
 
+// TestSetWorkerCountNoGenerationOverlap проверяет, что задачи, отправленные
+// сразу после увеличения WorkerLimit, не могут быть перехвачены диспетчером
+// уходящего поколения и отклонены с ErrDispatcherStopped вместо выполнения
+// под новым лимитом (docs/CONCURRENCY_AUDIT.md, находка №1).
+func TestSetWorkerCountNoGenerationOverlap(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+
+	cfg := newTestConfig()
+	cfg.WorkerCount = 16
+	m := startManager(t, provider, cfg)
+
+	holdRelease := make(chan struct{})
+	holdDone := make(chan error, 1)
+	holder := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
+		<-holdRelease
+		return nil
+	}}
+
+	if err := m.SubmitTask(tenantID, newTask(tenantID, holder, func(err error) { holdDone <- err })); err != nil {
+		t.Fatalf("submit holder: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	const newLimit = 4
+
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: newLimit}})
+
+	if err := m.refreshTenants(); err != nil {
+		t.Fatalf("refreshTenants: %v", err)
+	}
+
+	var running atomic.Int32
+
+	atLimit := make(chan struct{}, 1)
+	release := make(chan struct{})
+	results := make(chan error, newLimit)
+
+	exec := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
+		if int(running.Add(1)) == newLimit {
+			select {
+			case atLimit <- struct{}{}:
+			default:
+			}
+		}
+
+		<-release
+		running.Add(-1)
+
+		return nil
+	}}
+
+	for range newLimit {
+		if err := m.SubmitTask(tenantID, newTask(tenantID, exec, func(err error) { results <- err })); err != nil {
+			t.Fatalf("SubmitTask: %v", err)
+		}
+	}
+
+	waitSignal(t, atLimit, 5*time.Second,
+		"burst tasks did not reach new concurrency limit — a task may have been claimed by the outgoing generation")
+
+	close(release)
+
+	for range newLimit {
+		if err := waitComplete(t, results, 5*time.Second, "burst task Complete never called"); err != nil {
+			t.Errorf("burst task completed with unexpected error: %v", err)
+		}
+	}
+
+	close(holdRelease)
+
+	if err := waitComplete(t, holdDone, 5*time.Second, "holder task Complete never called"); err != nil {
+		t.Errorf("holder task completed with unexpected error: %v", err)
+	}
+}
+
 // --- Graceful shutdown ---
 
 // TestStopDoesNotDeadlock проверяет, что Stop() завершается в течение

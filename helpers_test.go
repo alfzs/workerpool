@@ -91,6 +91,30 @@ func startManager(t *testing.T, provider TenantProvider, cfg Config) *WorkerMana
 	return m
 }
 
+// waitSignal ждёт закрытия/отправки в ch не дольше timeout, иначе — t.Fatal(msg).
+func waitSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+		t.Fatal(msg)
+	}
+}
+
+// waitComplete ждёт значение из ch не дольше timeout, иначе — t.Fatal(msg).
+func waitComplete(t *testing.T, ch <-chan error, timeout time.Duration, msg string) error {
+	t.Helper()
+
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(timeout):
+		t.Fatal(msg)
+		return nil
+	}
+}
+
 // newTask формирует Task с context.Background() и новым TaskID.
 func newTask(tenantID uuid.UUID, exec TaskExecutor, complete func(error)) Task {
 	return Task{
