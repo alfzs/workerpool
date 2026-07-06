@@ -15,48 +15,48 @@ import "github.com/google/uuid"
 type HealthStatus struct {
 	// Healthy равен true, пока менеджер работает и не находится в процессе
 	// остановки. Используйте это поле как основной сигнал живости.
-	Healthy bool
+	Healthy bool `json:"healthy"`
 
 	// Stopping равен true после вызова Stop().
-	Stopping bool
+	Stopping bool `json:"stopping"`
 
 	// PoolQueueDepth — количество задач, ожидающих в очереди глобального пула.
 	// Значение, близкое к PoolQueueCapacity, сигнализирует о backpressure.
-	PoolQueueDepth int
+	PoolQueueDepth int `json:"pool_queue_depth"`
 
 	// PoolQueueCapacity — максимальная ёмкость очереди глобального пула
 	// (Config.TaskQueueSize).
-	PoolQueueCapacity int
+	PoolQueueCapacity int `json:"pool_queue_capacity"`
 
 	// PoolWorkerCount — количество горутин-воркеров в глобальном пуле
 	// (Config.WorkerCount).
-	PoolWorkerCount int
+	PoolWorkerCount int `json:"pool_worker_count"`
 
 	// TenantCount — количество тенантов, отслеживаемых менеджером на момент снимка.
-	TenantCount int
+	TenantCount int `json:"tenant_count"`
 
 	// Tenants содержит детальную информацию по каждому тенанту.
 	// Порядок элементов не определён.
-	Tenants []TenantHealth
+	Tenants []TenantHealth `json:"tenants"`
 }
 
 // TenantHealth — состояние одного тенанта внутри HealthStatus.
 type TenantHealth struct {
 	// TenantID — идентификатор тенанта.
-	TenantID uuid.UUID
+	TenantID uuid.UUID `json:"tenant_id"`
 
 	// QueueDepth — количество задач, ожидающих в локальном буфере тенанта.
 	// Значение, близкое к QueueCapacity, означает, что SubmitTask начнёт
 	// возвращать ошибку «очередь заполнена» для этого тенанта.
-	QueueDepth int
+	QueueDepth int `json:"queue_depth"`
 
 	// QueueCapacity — полная ёмкость буфера задач тенанта
 	// (Config.TenantQueueSize).
-	QueueCapacity int
+	QueueCapacity int `json:"queue_capacity"`
 
 	// WorkerLimit — максимальное количество одновременных задач тенанта
 	// согласно последнему ответу TenantProvider.
-	WorkerLimit int
+	WorkerLimit int `json:"worker_limit"`
 }
 
 // Health возвращает снимок текущего состояния WorkerManager.

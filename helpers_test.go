@@ -15,6 +15,8 @@ type mockTenant struct {
 	limit int
 }
 
+var _ Tenant = (*mockTenant)(nil)
+
 func (m *mockTenant) ID() uuid.UUID    { return m.id }
 func (m *mockTenant) WorkerLimit() int { return m.limit }
 
@@ -24,6 +26,8 @@ type mockTenantProvider struct {
 	tenants []Tenant
 	err     error
 }
+
+var _ TenantProvider = (*mockTenantProvider)(nil)
 
 func (m *mockTenantProvider) List(_ context.Context) ([]Tenant, error) {
 	m.mu.Lock()
@@ -43,6 +47,8 @@ func (m *mockTenantProvider) set(tenants []Tenant) {
 type mockExecutor struct {
 	fn func(ctx context.Context, tenantID uuid.UUID, workerID int) error
 }
+
+var _ TaskExecutor = (*mockExecutor)(nil)
 
 func (m *mockExecutor) Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error {
 	return m.fn(ctx, tenantID, workerID)

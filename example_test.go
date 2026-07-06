@@ -13,6 +13,8 @@ import (
 // echoExecutor is a minimal TaskExecutor that always succeeds.
 type echoExecutor struct{}
 
+var _ workerpool.TaskExecutor = echoExecutor{}
+
 func (echoExecutor) Execute(_ context.Context, _ uuid.UUID, _ int) error { return nil }
 
 // ExampleExecutorRegistry demonstrates registering a TaskExecutor under a
@@ -40,6 +42,8 @@ type staticTenant struct {
 	limit int
 }
 
+var _ workerpool.Tenant = staticTenant{}
+
 func (t staticTenant) ID() uuid.UUID    { return t.id }
 func (t staticTenant) WorkerLimit() int { return t.limit }
 
@@ -47,6 +51,8 @@ func (t staticTenant) WorkerLimit() int { return t.limit }
 // implementation should cache its own results, since List is called
 // on every TenantRefreshInterval tick.
 type staticProvider struct{ tenants []workerpool.Tenant }
+
+var _ workerpool.TenantProvider = staticProvider{}
 
 func (p staticProvider) List(_ context.Context) ([]workerpool.Tenant, error) {
 	return p.tenants, nil
