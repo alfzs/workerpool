@@ -1,0 +1,113 @@
+# workerpool
+
+> Tenant-isolated worker pool for Go with per-tenant concurrency limits, retry with exponential backoff + jitter, OpenTelemetry tracing/metrics, and graceful shutdown.
+
+## Overview
+
+`workerpool` executes tasks for multiple tenants against a single shared pool of goroutines while enforcing a per-tenant concurrency limit. Each tenant gets one dispatcher goroutine and a weighted semaphore sized to `Tenant.GetWorkerLimit()`; the dispatcher gates entry into the shared pool so total concurrency never exceeds `min(sum of tenant limits, Config.WorkerCount)`. It is designed to sit behind a persistent job store such as [River](https://github.com/riverqueue/river) — the package itself only handles execution, not scheduling or persistence.
+
+## Quick Start
+
+```bash
+go get github.com/alfzs/workerpool/v2
+```
+
+```go
+cfg := workerpool.Config{
+    WorkerCount:           64,
+    TaskQueueSize:         512,
+    TenantQueueSize:       32,
+    GracefulTimeout:       30 * time.Second,
+    TaskTimeout:           2 * time.Minute,
+    TenantRefreshInterval: 30 * time.Second,
+    RetryPolicy: workerpool.RetryPolicy{
+        Attempts: workerpool.AttemptsConfig{Count: 3, MinDelay: time.Second, MaxDelay: 30 * time.Second},
+    },
+}
+
+manager, err := workerpool.NewWorkerManager(workerpool.WorkerManagerParams{
+    TenantProvider: myProvider, // implements workerpool.TenantProvider
+    Config:         cfg,
+})
+if err != nil {
+    log.Fatal(err)
+}
+if err := manager.Start(); err != nil {
+    log.Fatal(err)
+}
+defer manager.Stop()
+```
+
+## Key Concepts
+
+- **WorkerManager**: owns tenant lifecycle, periodically refreshes the active tenant set from `TenantProvider`, and runs one dispatcher goroutine per tenant.
+- **pool**: the shared, fixed-size goroutine pool that actually executes tasks, records OTel metrics/traces, and applies retries.
+- **ExecutorRegistry**: maps string keys (as stored in a job store row) to `TaskExecutor` implementations, resolved at execution time.
+- **Tenant isolation**: enforced via a `golang.org/x/sync/semaphore.Weighted` per tenant, not via per-tenant goroutine pools — this keeps goroutine count at O(number of tenants) rather than O(sum of limits).
+
+## API Reference
+
+### Core Types
+
+- `Config` — all tunable parameters (`WorkerCount`, `TaskQueueSize`, `TenantQueueSize`, `GracefulTimeout`, `TaskTimeout`, `TenantRefreshInterval`, `RetryPolicy`). Call `Config.Validate()` before use; `NewWorkerManager` calls it internally.
+- `RetryPolicy` / `AttemptsConfig` / `JitterConfig` — retry attempt count and exponential-backoff-with-full-jitter delay bounds.
+- `WorkerManager` — manages tenants and dispatches tasks into the shared pool. Methods: `Start()`, `Stop()`, `SubmitTask(tenantID, task)`, `GetActiveTenants()`, `Health()`.
+- `Task` — unit of work: `Ctx`, `TaskID`, `TenantID`, `ExecutorKey` (or `Executor` directly), `Complete` callback (called exactly once).
+- `TenantProvider` (interface) — supplies the list of active tenants; implementations must cache and be safe for concurrent use.
+- `Tenant` (interface) — `GetID() uuid.UUID`, `GetWorkerLimit() int`.
+- `TaskExecutor` (interface) — `Execute(ctx, tenantID, workerID) error`; a non-nil error triggers a retry per `RetryPolicy`.
+- `ExecutorRegistry` — `Register`/`MustRegister`/`Get`/`Keys` for mapping string keys to `TaskExecutor` implementations.
+- `HealthStatus` / `TenantHealth` — point-in-time snapshot returned by `WorkerManager.Health()`.
+
+### Core Functions
+
+- `NewWorkerManager(WorkerManagerParams) (*WorkerManager, error)` — validates `Config` and constructs the manager and its pool.
+- `NewExecutorRegistry() *ExecutorRegistry` — creates an empty registry.
+
+## Common Patterns
+
+### Submitting a task
+
+```go
+registry := workerpool.NewExecutorRegistry()
+registry.MustRegister("sync_orders", &SyncOrdersExecutor{})
+
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+exec, _ := registry.Get("sync_orders")
+err := manager.SubmitTask(tenantID, workerpool.Task{
+    Ctx:      ctx,
+    TaskID:   uuid.New(),
+    TenantID: tenantID,
+    Executor: exec,
+    Complete: func(err error) {
+        cancel()
+        if err != nil {
+            slog.Error("task failed", "error", err)
+        }
+    },
+})
+```
+
+`SubmitTask` is non-blocking: it returns an error immediately if the tenant's queue is full or the tenant is shutting down.
+
+### Health checks
+
+```go
+h := manager.Health()
+// h.Healthy, h.Stopping, h.PoolQueueDepth, h.TenantCount, h.Tenants ([]TenantHealth)
+```
+
+## Error Handling
+
+- `Config.Validate()` returns a joined `error` (via `errors.Join`) listing every invalid field at once, not just the first one.
+- `SubmitTask` returns an error (does not panic or block) when: the tenant is unknown, the tenant's queue is full, or the tenant is shutting down.
+- `ExecutorRegistry.Register` / `Get` return errors for empty keys, nil executors, duplicate keys, or missing keys; `MustRegister` panics instead (intended for `init()`/`TestMain`).
+- `Task.Complete` is called exactly once per task — on success, after retries are exhausted, after a panic inside the executor, or if the dispatcher stops before the task could run.
+
+## References
+
+- Architecture & River integration: [ARCHITECTURE.md](https://github.com/alfzs/workerpool/blob/main/ARCHITECTURE.md)
+- Repository: https://github.com/alfzs/workerpool
+- Go Reference: https://pkg.go.dev/github.com/alfzs/workerpool/v2
+- Issues: https://github.com/alfzs/workerpool/issues
+- Changelog: https://github.com/alfzs/workerpool/blob/main/CHANGELOG.md
