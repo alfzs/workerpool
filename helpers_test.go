@@ -74,19 +74,21 @@ func newTestConfig() Config {
 }
 
 // startManager создаёт и запускает WorkerManager, регистрирует Stop в Cleanup.
-func startManager(t *testing.T, provider TenantProvider, cfg Config) *WorkerManager {
-	t.Helper()
+// Принимает testing.TB, а не *testing.T, чтобы быть переиспользуемым как в
+// тестах, так и в бенчмарках (*testing.B тоже реализует testing.TB).
+func startManager(tb testing.TB, provider TenantProvider, cfg Config) *WorkerManager {
+	tb.Helper()
 
 	m, err := NewWorkerManager(WorkerManagerParams{TenantProvider: provider, Config: cfg})
 	if err != nil {
-		t.Fatalf("NewWorkerManager: %v", err)
+		tb.Fatalf("NewWorkerManager: %v", err)
 	}
 
 	if err := m.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
+		tb.Fatalf("Start: %v", err)
 	}
 
-	t.Cleanup(m.Stop)
+	tb.Cleanup(m.Stop)
 
 	return m
 }
