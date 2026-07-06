@@ -720,6 +720,84 @@ func TestRefreshTenantsRemoveTenant(t *testing.T) {
 	}
 }
 
+// TestRefreshTenantsRemoveTenantDrainsQueue проверяет, что задачи, оставшиеся
+// в буфере taskQueue тенанта на момент его удаления, всё равно получают
+// Task.Complete(ErrDispatcherStopped) — а не теряются молча (SECURITY_AUDIT.md,
+// находка №1).
+func TestRefreshTenantsRemoveTenantDrainsQueue(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+	m := startManager(t, provider, newTestConfig())
+
+	blockCh := make(chan struct{})
+	blocker := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
+		<-blockCh
+		return nil
+	}}
+
+	// Задача A занимает единственный слот конкурентности тенанта — dispatch
+	// блокируется в sem.Acquire для следующей задачи.
+	aDone := make(chan error, 1)
+
+	if err := m.SubmitTask(tenantID, newTask(tenantID, blocker, func(err error) { aDone <- err })); err != nil {
+		t.Fatalf("submit A: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Задача B — на ней dispatch блокируется в sem.Acquire.
+	bDone := make(chan error, 1)
+
+	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(err error) { bDone <- err })); err != nil {
+		t.Fatalf("submit B: %v", err)
+	}
+
+	// Задача C остаётся непрочитанной в буфере taskQueue.
+	cDone := make(chan error, 1)
+
+	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(err error) { cDone <- err })); err != nil {
+		t.Fatalf("submit C: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Удаляем тенанта, пока A ещё выполняется, а B и C ждут в очереди.
+	provider.set(nil)
+
+	if err := m.refreshTenants(); err != nil {
+		t.Fatalf("refreshTenants: %v", err)
+	}
+
+	close(blockCh)
+
+	select {
+	case <-aDone:
+	case <-time.After(5 * time.Second):
+		t.Error("A: Complete never called")
+	}
+
+	select {
+	case err := <-bDone:
+		if !errors.Is(err, ErrDispatcherStopped) {
+			t.Errorf("B: expected ErrDispatcherStopped, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("B: Complete never called")
+	}
+
+	select {
+	case err := <-cDone:
+		if !errors.Is(err, ErrDispatcherStopped) {
+			t.Errorf("C: expected ErrDispatcherStopped, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("C: Complete never called")
+	}
+}
+
 // TestRefreshTenantsUpdateLimit проверяет, что увеличение WorkerLimit
 // вступает в силу после refreshTenants: новое число задач выполняется
 // одновременно.

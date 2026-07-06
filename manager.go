@@ -330,8 +330,9 @@ func (w *WorkerManager) refreshTenants() error {
 	// Удаляем тенантов, отсутствующих в списке, полученном от TenantProvider.
 	for id, state := range w.tenants {
 		if _, exists := wantSet[id]; !exists {
-			dropped := len(state.taskQueue)
 			state.cancel()
+
+			dropped := w.drainTaskQueue(state)
 			delete(w.tenants, id)
 
 			if dropped > 0 {
@@ -343,6 +344,29 @@ func (w *WorkerManager) refreshTenants() error {
 	}
 
 	return nil
+}
+
+// drainTaskQueue вычитывает оставшиеся задачи из state.taskQueue и вызывает
+// для каждой Task.Complete(ErrDispatcherStopped). Вызывается после
+// state.cancel() при удалении тенанта: диспетчер (dispatch) в этот момент
+// либо уже завершается, либо конкурентно читает из того же канала — раз
+// каждая задача достаётся ровно одному получателю, состязание за конкретную
+// задачу не приводит к двойному вызову Complete. Возвращает число слитых задач.
+func (w *WorkerManager) drainTaskQueue(state *tenantState) int {
+	dropped := 0
+
+	for {
+		select {
+		case task := <-state.taskQueue:
+			dropped++
+
+			if task.Complete != nil {
+				task.Complete(ErrDispatcherStopped)
+			}
+		default:
+			return dropped
+		}
+	}
 }
 
 // createTenant инициализирует новый tenantState и запускает диспетчер.
