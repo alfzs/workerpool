@@ -236,10 +236,18 @@ func (w *WorkerManager) SubmitTask(tenantID uuid.UUID, task Task) error {
 		task.Executor = exec
 	}
 
+	// RLock удерживается вплоть до отправки в taskQueue (не только на время
+	// поиска state) — иначе между RUnlock и select возможна гонка с
+	// refreshTenants: тенант может быть удалён (state.cancel + drainTaskQueue +
+	// delete) в этом промежутке, и задача, отправленная позже в уже
+	// осиротевший taskQueue, никогда не будет прочитана (см.
+	// docs/CONCURRENCY_AUDIT.md, находка №2). refreshTenants требует
+	// эксклюзивный Lock, поэтому удержание RLock здесь исключает гонку;
+	// сам select неблокирующий, так что критическая секция не растёт.
 	w.tenantsMu.RLock()
-	state, ok := w.tenants[tenantID]
-	w.tenantsMu.RUnlock()
+	defer w.tenantsMu.RUnlock()
 
+	state, ok := w.tenants[tenantID]
 	if !ok {
 		return fmt.Errorf("%w: tenant %s", ErrTenantNotFound, tenantID)
 	}

@@ -941,6 +941,80 @@ func TestSetWorkerCountNoGenerationOverlap(t *testing.T) {
 	}
 }
 
+// TestSubmitTaskNoRaceWithTenantRemoval проверяет, что SubmitTask не может
+// отправить задачу в taskQueue тенанта, конкурентно удаляемого refreshTenants:
+// до фикса окно между RUnlock и select позволяло задаче попасть в уже
+// осиротевший канал и потерять Complete навсегда (docs/CONCURRENCY_AUDIT.md,
+// находка №2). Тест переключает присутствие тенанта в цикле, конкурентно
+// с пачкой горутин, непрерывно вызывающих SubmitTask, и проверяет, что число
+// принятых задач равно числу вызовов Complete.
+func TestSubmitTaskNoRaceWithTenantRemoval(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 2}})
+
+	cfg := newTestConfig()
+	cfg.TenantQueueSize = 8
+	cfg.TenantRefreshInterval = time.Hour
+
+	m := startManager(t, provider, cfg)
+
+	var submitted, completed atomic.Int64
+
+	stop := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		present := true
+
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			present = !present
+			if present {
+				provider.set([]Tenant{&mockTenant{id: tenantID, limit: 2}})
+			} else {
+				provider.set(nil)
+			}
+
+			_ = m.refreshTenants()
+		}
+	})
+
+	for range 8 {
+		wg.Go(func() {
+			exec := successExec()
+			for range 2000 {
+				task := newTask(tenantID, exec, func(error) { completed.Add(1) })
+				if err := m.SubmitTask(tenantID, task); err == nil {
+					submitted.Add(1)
+				}
+			}
+		})
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && completed.Load() != submitted.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if completed.Load() != submitted.Load() {
+		t.Errorf("leaked tasks: submitted=%d completed=%d (gap=%d)",
+			submitted.Load(), completed.Load(), submitted.Load()-completed.Load())
+	}
+}
+
 // --- Graceful shutdown ---
 
 // TestStopDoesNotDeadlock проверяет, что Stop() завершается в течение
