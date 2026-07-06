@@ -544,6 +544,55 @@ func TestTaskRetryOnError(t *testing.T) {
 
 // --- Контекст ---
 
+// TestExecuteRespectsConfiguredTaskTimeout проверяет, что Config.TaskTimeout
+// реально ограничивает выполнение задачи, даже если Task.Ctx не несёт
+// собственного дедлайна (docs/DESIGN_PATTERNS_AUDIT.md, находка №1).
+func TestExecuteRespectsConfiguredTaskTimeout(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+
+	cfg := newTestConfig()
+	cfg.TaskTimeout = 50 * time.Millisecond
+	cfg.RetryPolicy.Attempts.Count = 1
+	m := startManager(t, provider, cfg)
+
+	started := make(chan struct{})
+	exec := &mockExecutor{fn: func(ctx context.Context, _ uuid.UUID, _ int) error {
+		close(started)
+		<-ctx.Done()
+
+		return ctx.Err()
+	}}
+
+	done := make(chan error, 1)
+
+	// Task.Ctx намеренно без собственного дедлайна — ограничение должно
+	// прийти исключительно из Config.TaskTimeout.
+	if err := m.SubmitTask(tenantID, Task{
+		Ctx:      context.Background(),
+		TaskID:   uuid.New(),
+		TenantID: tenantID,
+		Executor: exec,
+		Complete: func(err error) { done <- err },
+	}); err != nil {
+		t.Fatalf("SubmitTask: %v", err)
+	}
+
+	<-started
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("expected context.DeadlineExceeded, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("task did not time out — Config.TaskTimeout was not applied")
+	}
+}
+
 // TestContextCancellationPropagated проверяет, что отмена Task.Ctx
 // распространяется в Executor.Execute.
 func TestContextCancellationPropagated(t *testing.T) {

@@ -275,9 +275,13 @@ func (p *pool) runTask(task Task, workerID int) {
 // в Task.Ctx. Если вызывающий код передал контекст с активным span'ом,
 // иерархия трассировки выстраивается автоматически.
 func (p *pool) executeWithRetry(task Task, workerID int) error {
-	// Создаём дочерний контекст, чтобы forceCancel не изменял контекст
-	// вызывающего кода.
-	taskCtx, taskCancel := context.WithCancel(task.Ctx)
+	// Config.TaskTimeout — дедлайн по умолчанию для всего executeWithRetry
+	// (включая все попытки и паузы между ними), а не для одной попытки.
+	// Если task.Ctx уже несёт более ранний дедлайн, WithTimeout его не
+	// отодвигает — context всегда берёт более раннюю из двух границ,
+	// что и реализует контракт «вызывающий код может задать более жёсткий
+	// дедлайн через Task.Ctx» (docs/DESIGN_PATTERNS_AUDIT.md, находка №1).
+	taskCtx, taskCancel := context.WithTimeout(task.Ctx, p.config.TaskTimeout)
 	defer taskCancel()
 
 	stopForce := context.AfterFunc(p.forceCtx, taskCancel)
