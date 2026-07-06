@@ -35,7 +35,7 @@ type Config struct {
 	TaskTimeout time.Duration `yaml:"task_timeout" env-default:"5m"`
 
 	// TenantRefreshInterval — как часто менеджер перезапрашивает список
-	// активных тенантов у TenantProvider. Должно быть > 0.
+	// тенантов у TenantProvider. Должно быть > 0.
 	TenantRefreshInterval time.Duration `yaml:"tenant_refresh_interval" env-default:"30s"`
 
 	// RetryPolicy задаёт поведение при повторных попытках выполнения задачи.
@@ -85,31 +85,39 @@ func (c Config) Validate() error {
 	var errs []error
 
 	if c.WorkerCount <= 0 {
-		errs = append(errs, fmt.Errorf("WorkerCount must be > 0, got %d", c.WorkerCount))
+		errs = append(errs, fmt.Errorf("workerpool: worker count must be > 0, got %d", c.WorkerCount))
 	}
+
 	if c.TaskQueueSize <= 0 {
-		errs = append(errs, fmt.Errorf("TaskQueueSize must be > 0, got %d", c.TaskQueueSize))
+		errs = append(errs, fmt.Errorf("workerpool: task queue size must be > 0, got %d", c.TaskQueueSize))
 	}
+
 	if c.TenantQueueSize <= 0 {
-		errs = append(errs, fmt.Errorf("TenantQueueSize must be > 0, got %d", c.TenantQueueSize))
+		errs = append(errs, fmt.Errorf("workerpool: tenant queue size must be > 0, got %d", c.TenantQueueSize))
 	}
+
 	if c.GracefulTimeout <= 0 {
-		errs = append(errs, fmt.Errorf("GracefulTimeout must be > 0, got %v", c.GracefulTimeout))
+		errs = append(errs, fmt.Errorf("workerpool: graceful timeout must be > 0, got %v", c.GracefulTimeout))
 	}
+
 	if c.TaskTimeout <= 0 {
-		errs = append(errs, fmt.Errorf("TaskTimeout must be > 0, got %v", c.TaskTimeout))
+		errs = append(errs, fmt.Errorf("workerpool: task timeout must be > 0, got %v", c.TaskTimeout))
 	}
+
 	if c.TenantRefreshInterval <= 0 {
-		errs = append(errs, fmt.Errorf("TenantRefreshInterval must be > 0, got %v", c.TenantRefreshInterval))
+		errs = append(errs, fmt.Errorf("workerpool: tenant refresh interval must be > 0, got %v", c.TenantRefreshInterval))
 	}
+
 	if c.RetryPolicy.Attempts.Count <= 0 {
-		errs = append(errs, fmt.Errorf("RetryPolicy.Attempts.Count must be >= 1, got %d", c.RetryPolicy.Attempts.Count))
+		errs = append(errs, fmt.Errorf("workerpool: retry attempts count must be >= 1, got %d", c.RetryPolicy.Attempts.Count))
 	}
+
 	if c.RetryPolicy.Attempts.MaxDelay < c.RetryPolicy.Attempts.MinDelay {
-		errs = append(errs, fmt.Errorf("RetryPolicy.Attempts.MaxDelay must be >= MinDelay"))
+		errs = append(errs, errors.New("workerpool: retry attempts max delay must be >= min delay"))
 	}
+
 	if c.RetryPolicy.Jitter.MaxDelay < c.RetryPolicy.Jitter.MinDelay {
-		errs = append(errs, fmt.Errorf("RetryPolicy.Jitter.MaxDelay must be >= MinDelay"))
+		errs = append(errs, errors.New("workerpool: retry jitter max delay must be >= min delay"))
 	}
 
 	return errors.Join(errs...)

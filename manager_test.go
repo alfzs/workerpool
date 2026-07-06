@@ -27,6 +27,7 @@ func TestManagerStartStop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWorkerManager: %v", err)
 	}
+
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -42,6 +43,7 @@ func TestManagerStartStop(t *testing.T) {
 	if h.Healthy {
 		t.Error("expected Healthy=false after Stop")
 	}
+
 	if !h.Stopping {
 		t.Error("expected Stopping=true after Stop")
 	}
@@ -82,9 +84,11 @@ func TestSubmitTaskCompletesSuccessfully(t *testing.T) {
 	m := startManager(t, provider, newTestConfig())
 
 	done := make(chan error, 1)
+
 	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(err error) { done <- err })); err != nil {
 		t.Fatalf("SubmitTask: %v", err)
 	}
+
 	select {
 	case err := <-done:
 		if err != nil {
@@ -103,6 +107,7 @@ func TestTenantConcurrencyLimit(t *testing.T) {
 	t.Parallel()
 
 	const limit = 3
+
 	tenantID := uuid.New()
 	provider := &mockTenantProvider{}
 	provider.set([]Tenant{&mockTenant{id: tenantID, limit: limit}})
@@ -112,8 +117,10 @@ func TestTenantConcurrencyLimit(t *testing.T) {
 	m := startManager(t, provider, cfg)
 
 	var running atomic.Int32
+
 	atLimit := make(chan struct{}, 1)
 	release := make(chan struct{})
+
 	var wg sync.WaitGroup
 
 	exec := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
@@ -123,14 +130,17 @@ func TestTenantConcurrencyLimit(t *testing.T) {
 			default:
 			}
 		}
+
 		<-release
 		running.Add(-1)
+
 		return nil
 	}}
 
 	// Отправляем задач больше лимита.
 	const total = limit + 2
 	wg.Add(total)
+
 	for range total {
 		if err := m.SubmitTask(tenantID, newTask(tenantID, exec, func(error) { wg.Done() })); err != nil {
 			t.Fatalf("SubmitTask: %v", err)
@@ -173,14 +183,17 @@ func TestTenantIsolation(t *testing.T) {
 	// Блокируем тенанта A: его семафор занят.
 	aRunning := make(chan struct{})
 	releaseA := make(chan struct{})
+
 	execA := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
 		close(aRunning)
 		<-releaseA
+
 		return nil
 	}}
 	if err := m.SubmitTask(tenantA, newTask(tenantA, execA, func(error) {})); err != nil {
 		t.Fatalf("SubmitTask A: %v", err)
 	}
+
 	select {
 	case <-aRunning:
 	case <-time.After(5 * time.Second):
@@ -189,6 +202,7 @@ func TestTenantIsolation(t *testing.T) {
 
 	// Отправляем задачу тенанту B — должна выполниться без ожидания A.
 	bDone := make(chan error, 1)
+
 	if err := m.SubmitTask(tenantB, newTask(tenantB, successExec(), func(err error) { bDone <- err })); err != nil {
 		t.Fatalf("SubmitTask B: %v", err)
 	}
@@ -211,7 +225,9 @@ func TestMultipleTenantsConcurrent(t *testing.T) {
 	t.Parallel()
 
 	const tenantCount = 8
+
 	tenants := make([]Tenant, tenantCount)
+
 	ids := make([]uuid.UUID, tenantCount)
 	for i := range tenantCount {
 		ids[i] = uuid.New()
@@ -226,6 +242,7 @@ func TestMultipleTenantsConcurrent(t *testing.T) {
 	m := startManager(t, provider, cfg)
 
 	var wg sync.WaitGroup
+
 	const tasksPerTenant = 4
 	wg.Add(tenantCount * tasksPerTenant)
 
@@ -238,7 +255,9 @@ func TestMultipleTenantsConcurrent(t *testing.T) {
 	}
 
 	done := make(chan struct{})
+
 	go func() { wg.Wait(); close(done) }()
+
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -280,9 +299,10 @@ func TestCompleteCalledExactlyOnce(t *testing.T) {
 		},
 	}
 
-	for _, sc := range scenarios {
+	for _, sc := range scenarios { //nolint:paralleltest // subtests share one manager/tenant and would race on its queue capacity if parallelized
 		t.Run(sc.name, func(t *testing.T) {
 			var count atomic.Int32
+
 			called := make(chan struct{})
 
 			if err := m.SubmitTask(tenantID, newTask(tenantID, sc.exec, func(error) {
@@ -301,6 +321,7 @@ func TestCompleteCalledExactlyOnce(t *testing.T) {
 
 			// Небольшая пауза, чтобы поймать гипотетический второй вызов.
 			time.Sleep(50 * time.Millisecond)
+
 			if n := count.Load(); n != 1 {
 				t.Errorf("Complete called %d times, want exactly 1", n)
 			}
@@ -324,9 +345,11 @@ func TestPanicDoesNotKillPool(t *testing.T) {
 		panic("test panic")
 	}}
 	panicDone := make(chan error, 1)
+
 	if err := m.SubmitTask(tenantID, newTask(tenantID, panicExec, func(err error) { panicDone <- err })); err != nil {
 		t.Fatalf("submit panicking task: %v", err)
 	}
+
 	select {
 	case err := <-panicDone:
 		if err == nil {
@@ -338,9 +361,11 @@ func TestPanicDoesNotKillPool(t *testing.T) {
 
 	// Пул должен продолжать работать после паники.
 	normalDone := make(chan error, 1)
+
 	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(err error) { normalDone <- err })); err != nil {
 		t.Fatalf("submit normal task after panic: %v", err)
 	}
+
 	select {
 	case err := <-normalDone:
 		if err != nil {
@@ -369,12 +394,14 @@ func TestTaskRetryOnError(t *testing.T) {
 	m := startManager(t, provider, cfg)
 
 	var attempts atomic.Int32
+
 	exec := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
 		attempts.Add(1)
 		return errors.New("transient error")
 	}}
 
 	done := make(chan error, 1)
+
 	if err := m.SubmitTask(tenantID, newTask(tenantID, exec, func(err error) { done <- err })); err != nil {
 		t.Fatalf("SubmitTask: %v", err)
 	}
@@ -384,6 +411,7 @@ func TestTaskRetryOnError(t *testing.T) {
 		if err == nil {
 			t.Error("expected error after exhausting retries")
 		}
+
 		if n := int(attempts.Load()); n != 3 {
 			t.Errorf("expected 3 attempts, got %d", n)
 		}
@@ -410,10 +438,12 @@ func TestContextCancellationPropagated(t *testing.T) {
 	exec := &mockExecutor{fn: func(ctx context.Context, _ uuid.UUID, _ int) error {
 		close(started)
 		<-ctx.Done()
+
 		return ctx.Err()
 	}}
 
 	done := make(chan error, 1)
+
 	if err := m.SubmitTask(tenantID, Task{
 		Ctx:      ctx,
 		TaskID:   uuid.New(),
@@ -445,6 +475,7 @@ func TestTenantQueueFull(t *testing.T) {
 	t.Parallel()
 
 	const queueSize = 2
+
 	tenantID := uuid.New()
 	provider := &mockTenantProvider{}
 	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
@@ -458,14 +489,17 @@ func TestTenantQueueFull(t *testing.T) {
 	// на sem.Acquire при попытке взять следующую задачу.
 	running := make(chan struct{})
 	release := make(chan struct{})
+
 	blocker := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
 		close(running)
 		<-release
+
 		return nil
 	}}
 	if err := m.SubmitTask(tenantID, newTask(tenantID, blocker, func(error) {})); err != nil {
 		t.Fatalf("task 1 submit: %v", err)
 	}
+
 	select {
 	case <-running:
 	case <-time.After(5 * time.Second):
@@ -475,6 +509,7 @@ func TestTenantQueueFull(t *testing.T) {
 	// Задача 2: диспетчер её подхватит и заблокируется на sem.Acquire.
 	// Даём небольшую паузу, чтобы диспетчер успел перейти в это состояние.
 	_ = m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(error) {}))
+
 	time.Sleep(30 * time.Millisecond)
 
 	// Заполняем taskQueue до ёмкости.
@@ -511,14 +546,17 @@ func TestRefreshTenantsAddTenant(t *testing.T) {
 
 	// Добавляем тенанта и принудительно обновляем.
 	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+
 	if err := m.refreshTenants(); err != nil {
 		t.Fatalf("refreshTenants: %v", err)
 	}
 
 	done := make(chan error, 1)
+
 	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(err error) { done <- err })); err != nil {
 		t.Fatalf("SubmitTask after refresh: %v", err)
 	}
+
 	select {
 	case err := <-done:
 		if err != nil {
@@ -541,13 +579,16 @@ func TestRefreshTenantsRemoveTenant(t *testing.T) {
 
 	// Убеждаемся, что тенант работает.
 	done := make(chan error, 1)
+
 	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(err error) { done <- err })); err != nil {
 		t.Fatalf("initial submit: %v", err)
 	}
+
 	<-done
 
 	// Удаляем тенанта и обновляем.
 	provider.set(nil)
+
 	if err := m.refreshTenants(); err != nil {
 		t.Fatalf("refreshTenants: %v", err)
 	}
@@ -573,14 +614,17 @@ func TestRefreshTenantsUpdateLimit(t *testing.T) {
 
 	const newLimit = 3
 	provider.set([]Tenant{&mockTenant{id: tenantID, limit: newLimit}})
+
 	if err := m.refreshTenants(); err != nil {
 		t.Fatalf("refreshTenants: %v", err)
 	}
 
 	// После увеличения лимита newLimit задач должны выполняться одновременно.
 	var running atomic.Int32
+
 	atLimit := make(chan struct{}, 1)
 	release := make(chan struct{})
+
 	var wg sync.WaitGroup
 	wg.Add(newLimit)
 
@@ -591,8 +635,10 @@ func TestRefreshTenantsUpdateLimit(t *testing.T) {
 			default:
 			}
 		}
+
 		<-release
 		running.Add(-1)
+
 		return nil
 	}}
 	for range newLimit {
@@ -606,6 +652,7 @@ func TestRefreshTenantsUpdateLimit(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not reach new concurrency limit after refresh")
 	}
+
 	if n := int(running.Load()); n != newLimit {
 		t.Errorf("expected %d concurrent tasks after limit update, got %d", newLimit, n)
 	}
@@ -634,6 +681,7 @@ func TestStopDoesNotDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWorkerManager: %v", err)
 	}
+
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -641,9 +689,11 @@ func TestStopDoesNotDeadlock(t *testing.T) {
 	// Запускаем задачи, которые блокируются на ctx.Done().
 	var started sync.WaitGroup
 	started.Add(4)
+
 	exec := &mockExecutor{fn: func(ctx context.Context, _ uuid.UUID, _ int) error {
 		started.Done()
 		<-ctx.Done()
+
 		return ctx.Err()
 	}}
 	for range 4 {
@@ -651,10 +701,12 @@ func TestStopDoesNotDeadlock(t *testing.T) {
 			t.Fatalf("SubmitTask: %v", err)
 		}
 	}
+
 	started.Wait()
 
 	// Stop должен вернуться после forceCancel (≈ GracefulTimeout).
 	stopDone := make(chan struct{})
+
 	go func() { m.Stop(); close(stopDone) }()
 
 	select {
@@ -673,6 +725,7 @@ func TestStopIdempotent(t *testing.T) {
 	m := startManager(t, provider, newTestConfig())
 
 	done := make(chan struct{})
+
 	go func() {
 		m.Stop()
 		m.Stop() // повторный вызов — должен быть no-op
@@ -708,15 +761,19 @@ func TestHealthStatus(t *testing.T) {
 	if !h.Healthy {
 		t.Error("Health.Healthy: want true")
 	}
+
 	if h.Stopping {
 		t.Error("Health.Stopping: want false")
 	}
+
 	if h.PoolWorkerCount != cfg.WorkerCount {
 		t.Errorf("Health.PoolWorkerCount: got %d, want %d", h.PoolWorkerCount, cfg.WorkerCount)
 	}
+
 	if h.PoolQueueCapacity != cfg.TaskQueueSize {
 		t.Errorf("Health.PoolQueueCapacity: got %d, want %d", h.PoolQueueCapacity, cfg.TaskQueueSize)
 	}
+
 	if h.TenantCount != 2 {
 		t.Errorf("Health.TenantCount: got %d, want 2", h.TenantCount)
 	}
@@ -725,11 +782,13 @@ func TestHealthStatus(t *testing.T) {
 	for _, th := range h.Tenants {
 		byID[th.TenantID] = th
 	}
+
 	if th, ok := byID[tenantA]; !ok {
 		t.Error("tenant A missing from Health.Tenants")
 	} else if th.WorkerLimit != 2 {
 		t.Errorf("tenant A WorkerLimit: got %d, want 2", th.WorkerLimit)
 	}
+
 	if th, ok := byID[tenantB]; !ok {
 		t.Error("tenant B missing from Health.Tenants")
 	} else if th.WorkerLimit != 5 {
@@ -737,12 +796,13 @@ func TestHealthStatus(t *testing.T) {
 	}
 }
 
-// TestGetActiveTenants проверяет, что GetActiveTenants возвращает
+// TestGetTenantIDs проверяет, что GetTenantIDs возвращает
 // корректный снимок идентификаторов без дублей.
-func TestGetActiveTenants(t *testing.T) {
+func TestGetTenantIDs(t *testing.T) {
 	t.Parallel()
 
 	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+
 	tenants := make([]Tenant, len(ids))
 	for i, id := range ids {
 		tenants[i] = &mockTenant{id: id, limit: 1}
@@ -752,18 +812,19 @@ func TestGetActiveTenants(t *testing.T) {
 	provider.set(tenants)
 	m := startManager(t, provider, newTestConfig())
 
-	active := m.GetActiveTenants()
+	active := m.GetTenantIDs()
 	if len(active) != len(ids) {
-		t.Fatalf("GetActiveTenants: got %d, want %d", len(active), len(ids))
+		t.Fatalf("GetTenantIDs: got %d, want %d", len(active), len(ids))
 	}
 
 	idSet := make(map[uuid.UUID]bool)
 	for _, id := range active {
 		idSet[id] = true
 	}
+
 	for _, id := range ids {
 		if !idSet[id] {
-			t.Errorf("tenant %s missing from GetActiveTenants", id)
+			t.Errorf("tenant %s missing from GetTenantIDs", id)
 		}
 	}
 }

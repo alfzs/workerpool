@@ -27,7 +27,7 @@ type Task struct {
 	// Если Ctx содержит активный OTel-span (например, из River worker или
 	// HTTP-обработчика), span пула станет его дочерним — иерархия
 	// трассировки выстраивается автоматически через контекст.
-	Ctx context.Context
+	Ctx context.Context //nolint:containedctx // Task is a data envelope passed by value through channels, not a long-lived object; ctx must travel with it
 
 	// TaskID — уникальный идентификатор конкретного запуска
 	// (например, ID job в River). Используется в логах и атрибутах span.
@@ -64,16 +64,16 @@ type pool struct {
 	maxAttempts int
 
 	// closeMu защищает инвариант «отправка в taskChan не происходит после его
-	// закрытия»: addTask удерживает RLock при проверке stopping и отправке;
+	// закрытия»: addTask удерживает RLock при проверке isStopping и отправке;
 	// stop() удерживает Lock при закрытии канала.
 	closeMu sync.RWMutex
 
-	wg       sync.WaitGroup
-	stopping atomic.Bool
+	wg         sync.WaitGroup
+	isStopping atomic.Bool
 
 	// forceCtx отменяется по истечении GracefulTimeout, распространяя
 	// отмену во все активные контексты задач.
-	forceCtx    context.Context
+	forceCtx    context.Context //nolint:containedctx // lifecycle context for the pool's own graceful-shutdown deadline, not a per-call context
 	forceCancel context.CancelFunc
 
 	// OTel-инструменты; инициализируются из глобального провайдера.
@@ -148,6 +148,7 @@ func (p *pool) start() {
 func (p *pool) runWorker(id int) {
 	for {
 		panicked := true
+
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -157,10 +158,13 @@ func (p *pool) runWorker(id int) {
 						slog.String("stack", string(debug.Stack())))
 				}
 			}()
+
 			p.worker(id)
+
 			panicked = false
 		}()
-		if !panicked || p.stopping.Load() {
+
+		if !panicked || p.isStopping.Load() {
 			return
 		}
 	}
@@ -170,7 +174,7 @@ func (p *pool) runWorker(id int) {
 // При истечении GracefulTimeout вызывает forceCancel и блокируется
 // до выхода всех горутин.
 func (p *pool) stop() {
-	if !p.stopping.CompareAndSwap(false, true) {
+	if !p.isStopping.CompareAndSwap(false, true) {
 		return
 	}
 
@@ -179,6 +183,7 @@ func (p *pool) stop() {
 	p.closeMu.Unlock()
 
 	done := make(chan struct{})
+
 	go func() {
 		p.wg.Wait()
 		close(done)
@@ -200,15 +205,15 @@ func (p *pool) addTask(task Task) error {
 	p.closeMu.RLock()
 	defer p.closeMu.RUnlock()
 
-	if p.stopping.Load() {
-		return fmt.Errorf("pool is stopping")
+	if p.isStopping.Load() {
+		return ErrPoolStopping
 	}
 
 	select {
 	case p.taskChan <- task:
 		return nil
 	default:
-		return fmt.Errorf("pool queue full (capacity %d)", cap(p.taskChan))
+		return fmt.Errorf("%w: capacity %d", ErrQueueFull, cap(p.taskChan))
 	}
 }
 
@@ -222,8 +227,16 @@ func (p *pool) worker(id int) {
 
 // runTask исполняет одну задачу с восстановлением после паники и гарантирует
 // единственный вызов Complete независимо от результата.
+//
+// Правило единственной обработки: результат либо передаётся вызывающему коду
+// через Complete, либо (если Complete не задан) логируется здесь как
+// последняя инстанция — никогда и то, и другое одновременно. Исключение —
+// сам факт паники: её стек-трейс логируется безусловно, поскольку это
+// информация о дефекте в Executor, недоступная вызывающему коду через
+// возвращаемую ошибку.
 func (p *pool) runTask(task Task, workerID int) {
 	var taskErr error
+
 	defer func() {
 		if r := recover(); r != nil {
 			taskErr = fmt.Errorf("panic: %v", r)
@@ -233,8 +246,17 @@ func (p *pool) runTask(task Task, workerID int) {
 				slog.Any("panic", r),
 				slog.String("stack", string(debug.Stack())))
 		}
+
 		if task.Complete != nil {
 			task.Complete(taskErr)
+			return
+		}
+
+		if taskErr != nil {
+			p.logger.Error("task failed with no completion handler",
+				slog.String("tenant_id", task.TenantID.String()),
+				slog.String("task_id", task.TaskID.String()),
+				slog.Any("error", taskErr))
 		}
 	}()
 
@@ -268,6 +290,7 @@ func (p *pool) executeWithRetry(task Task, workerID int) error {
 	defer span.End()
 
 	start := time.Now()
+
 	var lastErr error
 
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
@@ -278,6 +301,7 @@ func (p *pool) executeWithRetry(task Task, workerID int) error {
 			p.recordCompletion(task, time.Since(start), "success")
 			return nil
 		}
+
 		lastErr = err
 
 		if attempt == p.maxAttempts {
@@ -296,16 +320,15 @@ func (p *pool) executeWithRetry(task Task, workerID int) error {
 		case <-taskCtx.Done():
 			timer.Stop()
 			p.recordCompletion(task, time.Since(start), "cancelled")
+
 			return taskCtx.Err()
 		}
 	}
 
-	p.logger.Error("task failed after all retries",
-		slog.String("tenant_id", task.TenantID.String()),
-		slog.String("task_id", task.TaskID.String()),
-		slog.Any("error", lastErr))
-
+	// Логирование финальной ошибки — забота runTask (там известно, есть ли
+	// Complete-получатель), а не этого метода.
 	p.recordCompletion(task, time.Since(start), "failed")
+
 	return lastErr
 }
 
@@ -335,11 +358,13 @@ func exponentialBackoff(attempt int, minDelay, maxDelay time.Duration) time.Dura
 			exp = maxDelay
 			break
 		}
+
 		exp = next
 	}
+
 	if exp <= 0 {
 		return 0
 	}
 	// Полный jitter: равномерное случайное значение в [0, exp).
-	return rand.N(exp)
+	return rand.N(exp) //nolint:gosec // non-cryptographic jitter for retry backoff, not security-sensitive
 }

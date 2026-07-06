@@ -33,22 +33,22 @@ func ExampleExecutorRegistry() {
 }
 
 // staticTenant is a fixed-limit Tenant implementation for demonstration
-// purposes; a real implementation would back GetWorkerLimit with a value
+// purposes; a real implementation would back WorkerLimit with a value
 // that can change between refresh cycles.
 type staticTenant struct {
 	id    uuid.UUID
 	limit int
 }
 
-func (t staticTenant) GetID() uuid.UUID    { return t.id }
-func (t staticTenant) GetWorkerLimit() int { return t.limit }
+func (t staticTenant) ID() uuid.UUID    { return t.id }
+func (t staticTenant) WorkerLimit() int { return t.limit }
 
 // staticProvider is a TenantProvider returning a fixed tenant set; a real
-// implementation should cache its own results, since GetActive is called
+// implementation should cache its own results, since List is called
 // on every TenantRefreshInterval tick.
 type staticProvider struct{ tenants []workerpool.Tenant }
 
-func (p staticProvider) GetActive(_ context.Context) ([]workerpool.Tenant, error) {
+func (p staticProvider) List(_ context.Context) ([]workerpool.Tenant, error) {
 	return p.tenants, nil
 }
 
@@ -93,6 +93,7 @@ func ExampleNewWorkerManager() {
 	defer manager.Stop()
 
 	done := make(chan error, 1)
+
 	err = manager.SubmitTask(tenantID, workerpool.Task{
 		Ctx:      context.Background(),
 		TaskID:   uuid.New(),

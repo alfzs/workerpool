@@ -122,7 +122,7 @@ type FanOutWorker struct {
 }
 
 func (w *FanOutWorker) Work(ctx context.Context, job *river.Job[FanOutArgs]) error {
-    tenants := w.manager.GetActiveTenants()
+    tenants := w.manager.GetTenantIDs()
     batch := make([]river.InsertManyParams, len(tenants))
     for i, tid := range tenants {
         batch[i] = river.InsertManyParams{
@@ -360,7 +360,7 @@ type FanOutWorker struct {
 }
 
 func (w *FanOutWorker) Work(ctx context.Context, job *river.Job[FanOutArgs]) error {
-    tenants := w.manager.GetActiveTenants()
+    tenants := w.manager.GetTenantIDs()
     if len(tenants) == 0 {
         return nil
     }

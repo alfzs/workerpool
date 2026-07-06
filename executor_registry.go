@@ -28,20 +28,22 @@ func NewExecutorRegistry() *ExecutorRegistry {
 // зарегистрирован. Ключи чувствительны к регистру.
 func (r *ExecutorRegistry) Register(key string, exec TaskExecutor) error {
 	if key == "" {
-		return fmt.Errorf("executor key cannot be empty")
+		return ErrEmptyExecutorKey
 	}
+
 	if exec == nil {
-		return fmt.Errorf("executor for key %q is nil", key)
+		return fmt.Errorf("%w: key %q", ErrNilExecutor, key)
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.executors[key]; exists {
-		return fmt.Errorf("executor %q already registered", key)
+		return fmt.Errorf("%w: key %q", ErrExecutorAlreadyRegistered, key)
 	}
 
 	r.executors[key] = exec
+
 	return nil
 }
 
@@ -62,8 +64,9 @@ func (r *ExecutorRegistry) Get(key string) (TaskExecutor, error) {
 
 	exec, ok := r.executors[key]
 	if !ok {
-		return nil, fmt.Errorf("executor %q not found", key)
+		return nil, fmt.Errorf("%w: key %q", ErrExecutorNotFound, key)
 	}
+
 	return exec, nil
 }
 
@@ -76,5 +79,6 @@ func (r *ExecutorRegistry) Keys() []string {
 	for k := range r.executors {
 		keys = append(keys, k)
 	}
+
 	return keys
 }

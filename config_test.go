@@ -53,12 +53,15 @@ func TestConfigValidate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+
 			cfg := valid
 			tt.mutate(&cfg)
+
 			err := cfg.Validate()
 			if tt.wantErr && err == nil {
 				t.Error("expected error, got nil")
 			}
+
 			if !tt.wantErr && err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}

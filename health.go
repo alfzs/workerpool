@@ -25,7 +25,7 @@ type HealthStatus struct {
 	// (Config.WorkerCount).
 	PoolWorkerCount int
 
-	// TenantCount — количество активных тенантов на момент снимка.
+	// TenantCount — количество тенантов, отслеживаемых менеджером на момент снимка.
 	TenantCount int
 
 	// Tenants содержит детальную информацию по каждому тенанту.
@@ -58,9 +58,10 @@ type TenantHealth struct {
 // сразу после возврата. Метод безопасен для конкурентного вызова и не
 // блокирует приём задач.
 func (w *WorkerManager) Health() HealthStatus {
-	stopping := w.stopping.Load()
+	stopping := w.isStopping.Load()
 
 	w.tenantsMu.RLock()
+
 	tenants := make([]TenantHealth, 0, len(w.tenants))
 	for id, state := range w.tenants {
 		tenants = append(tenants, TenantHealth{
@@ -70,6 +71,7 @@ func (w *WorkerManager) Health() HealthStatus {
 			WorkerLimit:   state.limit,
 		})
 	}
+
 	tenantCount := len(w.tenants)
 	w.tenantsMu.RUnlock()
 

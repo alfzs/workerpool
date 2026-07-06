@@ -15,8 +15,8 @@ type mockTenant struct {
 	limit int
 }
 
-func (m *mockTenant) GetID() uuid.UUID    { return m.id }
-func (m *mockTenant) GetWorkerLimit() int { return m.limit }
+func (m *mockTenant) ID() uuid.UUID    { return m.id }
+func (m *mockTenant) WorkerLimit() int { return m.limit }
 
 // mockTenantProvider — потокобезопасная реализация TenantProvider для тестов.
 type mockTenantProvider struct {
@@ -25,15 +25,17 @@ type mockTenantProvider struct {
 	err     error
 }
 
-func (m *mockTenantProvider) GetActive(_ context.Context) ([]Tenant, error) {
+func (m *mockTenantProvider) List(_ context.Context) ([]Tenant, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	return m.tenants, m.err
 }
 
 func (m *mockTenantProvider) set(tenants []Tenant) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.tenants = tenants
 }
 
@@ -68,14 +70,18 @@ func newTestConfig() Config {
 // startManager создаёт и запускает WorkerManager, регистрирует Stop в Cleanup.
 func startManager(t *testing.T, provider TenantProvider, cfg Config) *WorkerManager {
 	t.Helper()
+
 	m, err := NewWorkerManager(WorkerManagerParams{TenantProvider: provider, Config: cfg})
 	if err != nil {
 		t.Fatalf("NewWorkerManager: %v", err)
 	}
+
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+
 	t.Cleanup(m.Stop)
+
 	return m
 }
 

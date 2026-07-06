@@ -13,29 +13,30 @@ import (
 	"github.com/google/uuid"
 )
 
-// TenantProvider поставляет список активных тенантов.
-// Реализация должна быть безопасна для конкурентного использования и
-// кешировать результаты — менеджер вызывает GetActive на каждом тике
-// обновления.
+// TenantProvider поставляет список тенантов, которым должны быть назначены
+// воркеры; что делает тенанта пригодным для этого списка — решает
+// реализация, workerpool об этом не судит. Реализация должна быть безопасна
+// для конкурентного использования и кешировать результаты — менеджер
+// вызывает List на каждом тике обновления.
 type TenantProvider interface {
-	// GetActive возвращает всех тенантов, которым должны быть назначены
+	// List возвращает всех тенантов, которым должны быть назначены
 	// воркеры. Тенант, отсутствующий в результате, будет удалён из
 	// внутреннего состояния менеджера.
-	GetActive(ctx context.Context) ([]Tenant, error)
+	List(ctx context.Context) ([]Tenant, error)
 }
 
 // Tenant представляет клиента, чьи задачи выполняются в рамках
 // изолированного лимита конкурентности. Реализация должна быть
 // безопасна для конкурентного использования.
 type Tenant interface {
-	// GetID возвращает уникальный идентификатор тенанта. Никогда не должен
+	// ID возвращает уникальный идентификатор тенанта. Никогда не должен
 	// возвращать uuid.Nil.
-	GetID() uuid.UUID
+	ID() uuid.UUID
 
-	// GetWorkerLimit возвращает максимальное количество одновременно
+	// WorkerLimit возвращает максимальное количество одновременно
 	// выполняемых задач для этого тенанта. Изменение значения вступает в силу
 	// на следующем цикле обновления.
-	GetWorkerLimit() int
+	WorkerLimit() int
 }
 
 // TaskExecutor выполняет фактическую работу одного запуска задачи.
@@ -48,7 +49,7 @@ type TaskExecutor interface {
 	Execute(ctx context.Context, tenantID uuid.UUID, workerID int) error
 }
 
-// tenantState — runtime-состояние одного активного тенанта.
+// tenantState — runtime-состояние одного тенанта, отслеживаемого менеджером.
 //
 // taskQueue никогда не закрывается: жизненный цикл сигнализируется через
 // отмену контекста, что исключает панику при отправке в закрытый канал.
@@ -68,7 +69,7 @@ type tenantState struct {
 	sem       *semaphore.Weighted
 	genCancel context.CancelFunc
 
-	ctx    context.Context
+	ctx    context.Context //nolint:containedctx // lifecycle context scoping this tenant's dispatcher goroutine, not a per-call context
 	cancel context.CancelFunc
 }
 
@@ -83,19 +84,19 @@ type WorkerManager struct {
 	config   Config
 	pool     *pool
 
-	ctx    context.Context
+	ctx    context.Context //nolint:containedctx // lifecycle context scoping the manager's own background goroutines, not a per-call context
 	cancel context.CancelFunc
 
 	tenantsMu sync.RWMutex
 	tenants   map[uuid.UUID]*tenantState
 
-	wg       sync.WaitGroup
-	stopping atomic.Bool
+	wg         sync.WaitGroup
+	isStopping atomic.Bool
 }
 
 // WorkerManagerParams содержит все зависимости для NewWorkerManager.
 type WorkerManagerParams struct {
-	// TenantProvider поставляет список активных тенантов.
+	// TenantProvider поставляет список тенантов, которым нужны воркеры.
 	TenantProvider TenantProvider
 
 	// Config содержит все настраиваемые параметры. Config.Validate()
@@ -161,7 +162,7 @@ func (w *WorkerManager) Start() error {
 //
 // Идемпотентен: повторный вызов безопасен.
 func (w *WorkerManager) Stop() {
-	if w.stopping.Swap(true) {
+	if w.isStopping.Swap(true) {
 		return
 	}
 
@@ -169,7 +170,7 @@ func (w *WorkerManager) Stop() {
 	w.cancel()
 
 	// Отменяем контексты тенантов под блокировкой — это создаёт happens-before
-	// с refreshTenants, который проверяет stopping под той же блокировкой перед
+	// с refreshTenants, который проверяет isStopping под той же блокировкой перед
 	// wg.Add, что исключает гонку wg.Add / wg.Wait.
 	w.tenantsMu.Lock()
 	for _, t := range w.tenants {
@@ -194,22 +195,22 @@ func (w *WorkerManager) SubmitTask(tenantID uuid.UUID, task Task) error {
 	w.tenantsMu.RUnlock()
 
 	if !ok {
-		return fmt.Errorf("tenant %s not found", tenantID)
+		return fmt.Errorf("%w: tenant %s", ErrTenantNotFound, tenantID)
 	}
 
 	select {
 	case state.taskQueue <- task:
 		return nil
 	case <-state.ctx.Done():
-		return fmt.Errorf("tenant %s is shutting down", tenantID)
+		return fmt.Errorf("%w: tenant %s", ErrTenantShuttingDown, tenantID)
 	default:
-		return fmt.Errorf("tenant %s queue full (capacity %d)", tenantID, cap(state.taskQueue))
+		return fmt.Errorf("%w: tenant %s, capacity %d", ErrTenantQueueFull, tenantID, cap(state.taskQueue))
 	}
 }
 
-// GetActiveTenants возвращает снимок идентификаторов всех активных тенантов.
-// Порядок не определён.
-func (w *WorkerManager) GetActiveTenants() []uuid.UUID {
+// GetTenantIDs возвращает снимок идентификаторов всех тенантов, которые
+// сейчас отслеживаются менеджером. Порядок не определён.
+func (w *WorkerManager) GetTenantIDs() []uuid.UUID {
 	w.tenantsMu.RLock()
 	defer w.tenantsMu.RUnlock()
 
@@ -217,6 +218,7 @@ func (w *WorkerManager) GetActiveTenants() []uuid.UUID {
 	for id := range w.tenants {
 		ids = append(ids, id)
 	}
+
 	return ids
 }
 
@@ -251,30 +253,31 @@ func (w *WorkerManager) tenantRefresher() {
 //
 // Удерживает tenantsMu на протяжении всего обновления.
 func (w *WorkerManager) refreshTenants() error {
-	active, err := w.provider.GetActive(w.ctx)
+	tenants, err := w.provider.List(w.ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("list tenants: %w", err)
 	}
 
 	w.tenantsMu.Lock()
 	defer w.tenantsMu.Unlock()
 
 	// Защита от вызова после Stop().
-	if w.stopping.Load() {
+	if w.isStopping.Load() {
 		return nil
 	}
 
-	activeSet := make(map[uuid.UUID]struct{}, len(active))
+	wantSet := make(map[uuid.UUID]struct{}, len(tenants))
 
-	for _, t := range active {
-		id := t.GetID()
+	for _, t := range tenants {
+		id := t.ID()
 		if id == uuid.Nil {
 			w.logger.Warn("skipping tenant with nil id")
 			continue
 		}
-		activeSet[id] = struct{}{}
 
-		limit := t.GetWorkerLimit()
+		wantSet[id] = struct{}{}
+
+		limit := t.WorkerLimit()
 		if limit <= 0 {
 			w.logger.Warn("invalid worker limit, using 1",
 				slog.String("tenant_id", id.String()),
@@ -289,12 +292,13 @@ func (w *WorkerManager) refreshTenants() error {
 		}
 	}
 
-	// Удаляем тенантов, отсутствующих в активном множестве.
+	// Удаляем тенантов, отсутствующих в списке, полученном от TenantProvider.
 	for id, state := range w.tenants {
-		if _, exists := activeSet[id]; !exists {
+		if _, exists := wantSet[id]; !exists {
 			dropped := len(state.taskQueue)
 			state.cancel()
 			delete(w.tenants, id)
+
 			if dropped > 0 {
 				w.logger.Debug("tenant removed, tasks dropped",
 					slog.String("tenant_id", id.String()),
@@ -373,8 +377,9 @@ func (w *WorkerManager) dispatch(genCtx context.Context, state *tenantState, sem
 		if err := sem.Acquire(genCtx, 1); err != nil {
 			// genCtx отменён во время ожидания слота.
 			if task.Complete != nil {
-				task.Complete(fmt.Errorf("dispatcher stopped before task could run"))
+				task.Complete(ErrDispatcherStopped)
 			}
+
 			return
 		}
 
@@ -382,16 +387,23 @@ func (w *WorkerManager) dispatch(genCtx context.Context, state *tenantState, sem
 		original := task.Complete
 		task.Complete = func(err error) {
 			sem.Release(1)
+
 			if original != nil {
 				original(err)
 			}
 		}
 
-		// Шаг 4: передача в глобальный пул.
+		// Шаг 4: передача в глобальный пул. Правило единственной обработки:
+		// если у задачи есть исходный получатель (original), ошибка передаётся
+		// ему через Complete; лог здесь — только запасной канал на случай,
+		// когда обработать ошибку больше некому.
 		if err := w.pool.addTask(task); err != nil {
-			w.logger.Warn("pool rejected task",
-				slog.String("tenant_id", state.id.String()),
-				slog.Any("error", err))
+			if original == nil {
+				w.logger.Warn("pool rejected task with no completion handler",
+					slog.String("tenant_id", state.id.String()),
+					slog.Any("error", err))
+			}
+
 			task.Complete(err)
 		}
 	}
