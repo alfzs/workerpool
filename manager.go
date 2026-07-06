@@ -344,7 +344,7 @@ func (w *WorkerManager) setWorkerCount(state *tenantState, limit int) {
 	state.limit = limit
 
 	w.wg.Add(1)
-	go w.dispatch(state, sem, genCtx)
+	go w.dispatch(genCtx, state, sem)
 }
 
 // dispatch — единственная горутина-диспетчер на тенанта, обеспечивающая
@@ -357,7 +357,7 @@ func (w *WorkerManager) setWorkerCount(state *tenantState, limit int) {
 //  2. Захватывает слот семафора — блокируется, если лимит исчерпан.
 //  3. Оборачивает Complete для освобождения слота после завершения задачи.
 //  4. Передаёт задачу в глобальный пул.
-func (w *WorkerManager) dispatch(state *tenantState, sem *semaphore.Weighted, genCtx context.Context) {
+func (w *WorkerManager) dispatch(genCtx context.Context, state *tenantState, sem *semaphore.Weighted) {
 	defer w.wg.Done()
 
 	for {

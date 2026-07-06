@@ -273,12 +273,12 @@ func (p *pool) executeWithRetry(task Task, workerID int) error {
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
 		span.SetAttributes(attribute.Int("attempt", attempt))
 
-		if err := task.Executor.Execute(ctx, task.TenantID, workerID); err == nil {
+		err := task.Executor.Execute(ctx, task.TenantID, workerID)
+		if err == nil {
 			p.recordCompletion(task, time.Since(start), "success")
 			return nil
-		} else {
-			lastErr = err
 		}
+		lastErr = err
 
 		if attempt == p.maxAttempts {
 			break
@@ -329,7 +329,7 @@ func exponentialBackoff(attempt int, minDelay, maxDelay time.Duration) time.Dura
 	}
 	// Экспоненциальный рост: minDelay * 2^(attempt-1), не превышая maxDelay.
 	exp := minDelay
-	for i := 1; i < attempt; i++ {
+	for range attempt - 1 {
 		next := exp * 2
 		if next > maxDelay || next < exp { // защита от переполнения int64
 			exp = maxDelay
