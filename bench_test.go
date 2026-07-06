@@ -2,11 +2,25 @@ package workerpool
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// TestMain отключает slog.Default() перед бенчмарками: startManager/Stop
+// логируют INFO-события жизненного цикла на каждой итерации setup/teardown,
+// и при перенаправлении вывода `go test -bench=... | tee report.txt` эти
+// строки перемежаются с результатами бенчмарков построчно, ломая парсер
+// benchstat. Сама запись лога происходит вне таймируемого участка
+// (b.Loop()/b.RunParallel), так что на ns/op это не влияет — меняется
+// только место вывода, не объём работы.
+func TestMain(m *testing.M) {
+	slog.SetDefault(slog.New(slog.DiscardHandler))
+	os.Exit(m.Run())
+}
 
 // BenchmarkSubmitTask измеряет сквозную стоимость одной задачи: SubmitTask +
 // прохождение через диспетчер тенанта и глобальный пул + вызов Complete.
