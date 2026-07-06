@@ -298,7 +298,7 @@ func (p *pool) executeWithRetry(task Task, workerID int) error {
 
 		err := task.Executor.Execute(ctx, task.TenantID, workerID)
 		if err == nil {
-			p.recordCompletion(task, time.Since(start), "success")
+			p.recordCompletion(ctx, task, time.Since(start), "success")
 			return nil
 		}
 
@@ -319,7 +319,7 @@ func (p *pool) executeWithRetry(task Task, workerID int) error {
 		case <-timer.C:
 		case <-taskCtx.Done():
 			timer.Stop()
-			p.recordCompletion(task, time.Since(start), "cancelled")
+			p.recordCompletion(ctx, task, time.Since(start), "cancelled")
 
 			return taskCtx.Err()
 		}
@@ -327,20 +327,25 @@ func (p *pool) executeWithRetry(task Task, workerID int) error {
 
 	// Логирование финальной ошибки — забота runTask (там известно, есть ли
 	// Complete-получатель), а не этого метода.
-	p.recordCompletion(task, time.Since(start), "failed")
+	p.recordCompletion(ctx, task, time.Since(start), "failed")
 
 	return lastErr
 }
 
 // recordCompletion записывает OTel-метрики по завершении задачи.
 // status: "success" | "failed" | "cancelled".
-func (p *pool) recordCompletion(task Task, dur time.Duration, status string) {
+//
+// ctx — контекст задачи (со span'ом), а не context.Background(): это
+// сохраняет связь метрики с трейсом задачи через exemplar'ы у тех
+// экспортёров метрик, что их поддерживают. Запись метрики не блокируется
+// и не зависит от отмены ctx — принять уже отменённый ctx безопасно.
+func (p *pool) recordCompletion(ctx context.Context, task Task, dur time.Duration, status string) {
 	attrs := metric.WithAttributes(
 		attribute.String("tenant.id", task.TenantID.String()),
 		attribute.String("status", status),
 	)
-	p.taskDuration.Record(context.Background(), dur.Seconds(), attrs)
-	p.tasksTotal.Add(context.Background(), 1, attrs)
+	p.taskDuration.Record(ctx, dur.Seconds(), attrs)
+	p.tasksTotal.Add(ctx, 1, attrs)
 }
 
 // exponentialBackoff вычисляет задержку перед следующей попыткой.
