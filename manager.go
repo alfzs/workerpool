@@ -1,6 +1,7 @@
 package workerpool
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -143,10 +144,7 @@ func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	logger := p.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger := cmp.Or(p.Logger, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 
