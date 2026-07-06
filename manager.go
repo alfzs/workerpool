@@ -89,7 +89,8 @@ type tenantState struct {
 // соблюдение лимита конкурентности через взвешенный семафор перед передачей
 // задачи в общий глобальный пул.
 type WorkerManager struct {
-	// logger инициализируется из slog.Default() с атрибутом component.
+	// logger — переданный через WorkerManagerParams.Logger (или slog.Default(),
+	// если не задан), с добавленным атрибутом component=worker_manager.
 	logger   *slog.Logger
 	provider TenantProvider
 	config   Config
@@ -122,13 +123,19 @@ type WorkerManagerParams struct {
 	// Executor напрямую. Опционально: если задачи всегда приходят с уже
 	// заполненным Executor, оставьте nil.
 	ExecutorRegistry *ExecutorRegistry
+
+	// Logger используется менеджером и внутренним пулом (с добавленным
+	// атрибутом component). Опционально: если не задан, используется
+	// slog.Default().
+	Logger *slog.Logger
 }
 
 // NewWorkerManager создаёт WorkerManager. Возвращает ошибку, если Config
 // не прошёл валидацию или не удалось инициализировать глобальный пул.
 //
-// Логирование ведётся через slog.Default() — настройте глобальный логгер
-// до вызова этой функции.
+// Логирование: если WorkerManagerParams.Logger не задан, используется
+// slog.Default() — единый экземпляр разделяется менеджером и внутренним
+// пулом (у каждого свой атрибут component).
 // OTel-трассировка и метрики используют глобальные провайдеры: настройте
 // otel.SetTracerProvider и otel.SetMeterProvider до старта менеджера.
 func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
@@ -136,16 +143,21 @@ func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
+	logger := p.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
-	pl, err := newPool(poolParams{config: p.Config})
+	pl, err := newPool(poolParams{config: p.Config, logger: logger})
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create pool: %w", err)
 	}
 
 	return &WorkerManager{
-		logger:           slog.Default().With(slog.String("component", "worker_manager")),
+		logger:           logger.With(slog.String("component", "worker_manager")),
 		provider:         p.TenantProvider,
 		config:           p.Config,
 		pool:             pl,

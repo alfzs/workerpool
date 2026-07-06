@@ -55,7 +55,9 @@ type Task struct {
 // pool — разделяемый пул фиксированного размера, исполняющий задачи всех
 // тенантов. Управляет горутинами-воркерами, повторными попытками и OTel.
 type pool struct {
-	// logger инициализируется из slog.Default() с атрибутом component=pool.
+	// logger — переданный через poolParams.logger, с добавленным атрибутом
+	// component=pool (см. WorkerManagerParams.Logger — единый инжектируемый
+	// логгер для менеджера и пула, а не независимый slog.Default() у каждого).
 	logger *slog.Logger
 
 	config      Config
@@ -86,6 +88,7 @@ type pool struct {
 // poolParams — внутренние параметры для создания пула.
 type poolParams struct {
 	config Config
+	logger *slog.Logger
 }
 
 // newPool создаёт пул. Конфигурация должна быть провалидирована до вызова.
@@ -122,7 +125,7 @@ func newPool(p poolParams) (*pool, error) {
 	}
 
 	return &pool{
-		logger:       slog.Default().With(slog.String("component", "pool")),
+		logger:       p.logger.With(slog.String("component", "pool")),
 		config:       p.config,
 		workerCount:  p.config.WorkerCount,
 		maxAttempts:  maxAttempts,

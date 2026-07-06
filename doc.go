@@ -84,8 +84,8 @@ graceful shutdown.
 
 # Логирование и трассировка
 
-Логирование ведётся через slog.Default() — настройте глобальный логгер
-до вызова NewWorkerManager.
+Логирование ведётся через WorkerManagerParams.Logger; если не задан —
+через slog.Default().
 
 OTel-span создаётся вокруг каждого вызова Executor.Execute. Если Task.Ctx
 содержит активный span вызывающего кода (River worker, HTTP-обработчик),
