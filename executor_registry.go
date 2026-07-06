@@ -10,7 +10,9 @@ import (
 // сохранённое в базе, хранит только строковый ключ executor'а; реестр
 // разрешает его в конкретную реализацию во время исполнения.
 //
-// Все методы безопасны для конкурентного использования.
+// Все методы безопасны для конкурентного использования. Нулевое значение
+// ExecutorRegistry{} готово к использованию — вызывать NewExecutorRegistry
+// не обязательно.
 type ExecutorRegistry struct {
 	mu        sync.RWMutex
 	executors map[string]TaskExecutor
@@ -37,6 +39,10 @@ func (r *ExecutorRegistry) Register(key string, exec TaskExecutor) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.executors == nil {
+		r.executors = make(map[string]TaskExecutor)
+	}
 
 	if _, exists := r.executors[key]; exists {
 		return fmt.Errorf("%w: key %q", ErrExecutorAlreadyRegistered, key)

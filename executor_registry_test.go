@@ -18,6 +18,24 @@ func TestExecutorRegistry_Register(t *testing.T) {
 		}
 	})
 
+	t.Run("zero value", func(t *testing.T) {
+		t.Parallel()
+
+		var r ExecutorRegistry
+		if err := r.Register("key", successExec()); err != nil {
+			t.Fatalf("unexpected error registering on zero-value registry: %v", err)
+		}
+
+		got, err := r.Get("key")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got == nil {
+			t.Error("expected registered executor, got nil")
+		}
+	})
+
 	t.Run("empty key", func(t *testing.T) {
 		t.Parallel()
 

@@ -33,6 +33,20 @@ var (
 	ErrDispatcherStopped = errors.New("workerpool: dispatcher stopped before task could run")
 )
 
+// Ошибки валидации Task в SubmitTask. Проверяются через errors.Is.
+var (
+	// ErrTaskNilContext возвращается SubmitTask, если Task.Ctx равен nil.
+	ErrTaskNilContext = errors.New("workerpool: task context is nil")
+
+	// ErrTaskNoExecutor возвращается SubmitTask, если у задачи не задан ни
+	// Task.Executor, ни Task.ExecutorKey.
+	ErrTaskNoExecutor = errors.New("workerpool: task must set either executor or executor key")
+
+	// ErrNoExecutorRegistry возвращается SubmitTask, если у задачи задан
+	// Task.ExecutorKey, но WorkerManagerParams.ExecutorRegistry не настроен.
+	ErrNoExecutorRegistry = errors.New("workerpool: task sets executor key but no executor registry is configured")
+)
+
 // Ошибки ExecutorRegistry. Проверяются через errors.Is.
 var (
 	// ErrEmptyExecutorKey возвращается Register при попытке зарегистрировать

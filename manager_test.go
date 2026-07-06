@@ -99,6 +99,128 @@ func TestSubmitTaskCompletesSuccessfully(t *testing.T) {
 	}
 }
 
+// --- Валидация Task в SubmitTask ---
+
+func TestSubmitTaskNilContext(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+	m := startManager(t, provider, newTestConfig())
+
+	task := newTask(tenantID, successExec(), func(error) {})
+	task.Ctx = nil
+
+	if err := m.SubmitTask(tenantID, task); !errors.Is(err, ErrTaskNilContext) {
+		t.Errorf("expected ErrTaskNilContext, got %v", err)
+	}
+}
+
+func TestSubmitTaskNoExecutor(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+	m := startManager(t, provider, newTestConfig())
+
+	task := newTask(tenantID, nil, func(error) {})
+
+	if err := m.SubmitTask(tenantID, task); !errors.Is(err, ErrTaskNoExecutor) {
+		t.Errorf("expected ErrTaskNoExecutor, got %v", err)
+	}
+}
+
+func TestSubmitTaskExecutorKeyWithoutRegistry(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+	m := startManager(t, provider, newTestConfig())
+
+	task := newTask(tenantID, nil, func(error) {})
+	task.ExecutorKey = "sync_orders"
+
+	if err := m.SubmitTask(tenantID, task); !errors.Is(err, ErrNoExecutorRegistry) {
+		t.Errorf("expected ErrNoExecutorRegistry, got %v", err)
+	}
+}
+
+func TestSubmitTaskExecutorKeyUnknown(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+
+	m, err := NewWorkerManager(WorkerManagerParams{
+		TenantProvider:   provider,
+		Config:           newTestConfig(),
+		ExecutorRegistry: NewExecutorRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("NewWorkerManager: %v", err)
+	}
+
+	if err := m.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	t.Cleanup(m.Stop)
+
+	task := newTask(tenantID, nil, func(error) {})
+	task.ExecutorKey = "missing"
+
+	if err := m.SubmitTask(tenantID, task); !errors.Is(err, ErrExecutorNotFound) {
+		t.Errorf("expected ErrExecutorNotFound, got %v", err)
+	}
+}
+
+func TestSubmitTaskExecutorKeyResolved(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+
+	registry := NewExecutorRegistry()
+	registry.MustRegister("sync_orders", successExec())
+
+	m, err := NewWorkerManager(WorkerManagerParams{
+		TenantProvider:   provider,
+		Config:           newTestConfig(),
+		ExecutorRegistry: registry,
+	})
+	if err != nil {
+		t.Fatalf("NewWorkerManager: %v", err)
+	}
+
+	if err := m.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	t.Cleanup(m.Stop)
+
+	done := make(chan error, 1)
+	task := newTask(tenantID, nil, func(err error) { done <- err })
+	task.ExecutorKey = "sync_orders"
+
+	if err := m.SubmitTask(tenantID, task); err != nil {
+		t.Fatalf("SubmitTask: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("task error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("task did not complete")
+	}
+}
+
 // --- Изоляция тенантов ---
 
 // TestTenantConcurrencyLimit проверяет, что семафор не даёт запустить

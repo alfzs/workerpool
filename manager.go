@@ -90,6 +90,8 @@ type WorkerManager struct {
 	tenantsMu sync.RWMutex
 	tenants   map[uuid.UUID]*tenantState
 
+	executorRegistry *ExecutorRegistry
+
 	wg         sync.WaitGroup
 	isStopping atomic.Bool
 }
@@ -103,6 +105,12 @@ type WorkerManagerParams struct {
 	// вызывается внутри NewWorkerManager — передавать невалидный конфиг
 	// не нужно.
 	Config Config
+
+	// ExecutorRegistry, если задан, используется SubmitTask для разрешения
+	// Task.ExecutorKey в Task.Executor у задач, которые не заполнили
+	// Executor напрямую. Опционально: если задачи всегда приходят с уже
+	// заполненным Executor, оставьте nil.
+	ExecutorRegistry *ExecutorRegistry
 }
 
 // NewWorkerManager создаёт WorkerManager. Возвращает ошибку, если Config
@@ -126,13 +134,14 @@ func NewWorkerManager(p WorkerManagerParams) (*WorkerManager, error) {
 	}
 
 	return &WorkerManager{
-		logger:   slog.Default().With(slog.String("component", "worker_manager")),
-		provider: p.TenantProvider,
-		config:   p.Config,
-		pool:     pl,
-		ctx:      ctx,
-		cancel:   cancel,
-		tenants:  make(map[uuid.UUID]*tenantState),
+		logger:           slog.Default().With(slog.String("component", "worker_manager")),
+		provider:         p.TenantProvider,
+		config:           p.Config,
+		pool:             pl,
+		ctx:              ctx,
+		cancel:           cancel,
+		tenants:          make(map[uuid.UUID]*tenantState),
+		executorRegistry: p.ExecutorRegistry,
 	}, nil
 }
 
@@ -186,10 +195,36 @@ func (w *WorkerManager) Stop() {
 
 // SubmitTask помещает задачу в очередь указанного тенанта.
 //
+// Возвращает ошибку немедленно, без постановки в очередь, если Task.Ctx
+// равен nil, или если ни Task.Executor, ни разрешимый через
+// WorkerManagerParams.ExecutorRegistry Task.ExecutorKey не заданы —
+// это предотвращает панику глубже в воркере при исполнении задачи.
+//
 // Вызов неблокирующий: если очередь тенанта заполнена или тенант
 // останавливается, немедленно возвращается ошибка без изменения состояния.
 // Безопасен для конкурентного вызова из нескольких горутин.
 func (w *WorkerManager) SubmitTask(tenantID uuid.UUID, task Task) error {
+	if task.Ctx == nil {
+		return ErrTaskNilContext
+	}
+
+	if task.Executor == nil {
+		if task.ExecutorKey == "" {
+			return ErrTaskNoExecutor
+		}
+
+		if w.executorRegistry == nil {
+			return fmt.Errorf("%w: key %q", ErrNoExecutorRegistry, task.ExecutorKey)
+		}
+
+		exec, err := w.executorRegistry.Get(task.ExecutorKey)
+		if err != nil {
+			return fmt.Errorf("resolve executor: %w", err)
+		}
+
+		task.Executor = exec
+	}
+
 	w.tenantsMu.RLock()
 	state, ok := w.tenants[tenantID]
 	w.tenantsMu.RUnlock()
