@@ -65,7 +65,7 @@ graceful shutdown.
 		Complete: func(err error) {
 			cancel()
 			if err != nil {
-				slog.Error("task failed", "error", err)
+				slog.ErrorContext(ctx, "task failed", "error", err)
 			}
 		},
 	})
@@ -85,7 +85,13 @@ graceful shutdown.
 # Логирование и трассировка
 
 Логирование ведётся через WorkerManagerParams.Logger; если не задан —
-через slog.Default().
+через slog.Default(). Внутренние логи пакета используют *Context-варианты
+(slog.ErrorContext и т.п.) с наиболее релевантным доступным контекстом
+(Task.Ctx для операций конкретной задачи), чтобы обработчик логгера мог
+извлечь trace_id/span_id из активного OTel-спана и связать лог с трассировкой
+(например через go.opentelemetry.io/contrib/bridges/otelslog). Вызывающему
+коду рекомендуется следовать тому же соглашению в собственных обработчиках
+Task.Complete.
 
 OTel-span создаётся вокруг каждого вызова Executor.Execute. Если Task.Ctx
 содержит активный span вызывающего кода (River worker, HTTP-обработчик),

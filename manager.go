@@ -300,7 +300,7 @@ func (w *WorkerManager) tenantRefresher() {
 			return
 		case <-ticker.C:
 			if err := w.refreshTenants(); err != nil {
-				w.logger.Error("tenant refresh failed", slog.Any("error", err))
+				w.logger.ErrorContext(w.ctx, "tenant refresh failed", slog.Any("error", err))
 			}
 		}
 	}
@@ -335,7 +335,7 @@ func (w *WorkerManager) refreshTenants() error {
 	for _, t := range tenants {
 		id := t.ID()
 		if id == uuid.Nil {
-			w.logger.Warn("skipping tenant with nil id")
+			w.logger.WarnContext(w.ctx, "skipping tenant with nil id")
 			continue
 		}
 
@@ -343,7 +343,7 @@ func (w *WorkerManager) refreshTenants() error {
 
 		limit := t.WorkerLimit()
 		if limit <= 0 {
-			w.logger.Warn("invalid worker limit, using 1",
+			w.logger.WarnContext(w.ctx, "invalid worker limit, using 1",
 				slog.String("tenant_id", id.String()),
 				slog.Int("limit", limit))
 			limit = 1
@@ -365,7 +365,7 @@ func (w *WorkerManager) refreshTenants() error {
 			delete(w.tenants, id)
 
 			if dropped > 0 {
-				w.logger.Debug("tenant removed, tasks dropped",
+				w.logger.DebugContext(w.ctx, "tenant removed, tasks dropped",
 					slog.String("tenant_id", id.String()),
 					slog.Int("dropped", dropped))
 			}
@@ -502,7 +502,7 @@ func (w *WorkerManager) dispatch(genCtx context.Context, state *tenantState, sem
 		// когда обработать ошибку больше некому.
 		if err := w.pool.addTask(task); err != nil {
 			if original == nil {
-				w.logger.Warn("pool rejected task with no completion handler",
+				w.logger.WarnContext(task.Ctx, "pool rejected task with no completion handler",
 					slog.String("tenant_id", state.id.String()),
 					slog.Any("error", err))
 			}

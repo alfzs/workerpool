@@ -243,7 +243,7 @@ func (p *pool) runTask(task Task, workerID int) {
 	defer func() {
 		if r := recover(); r != nil {
 			taskErr = fmt.Errorf("panic: %v", r)
-			p.logger.Error("task panic",
+			p.logger.ErrorContext(task.Ctx, "task panic",
 				slog.String("tenant_id", task.TenantID.String()),
 				slog.String("task_id", task.TaskID.String()),
 				slog.Any("panic", r),
@@ -256,7 +256,7 @@ func (p *pool) runTask(task Task, workerID int) {
 		}
 
 		if taskErr != nil {
-			p.logger.Error("task failed with no completion handler",
+			p.logger.ErrorContext(task.Ctx, "task failed with no completion handler",
 				slog.String("tenant_id", task.TenantID.String()),
 				slog.String("task_id", task.TaskID.String()),
 				slog.Any("error", taskErr))
