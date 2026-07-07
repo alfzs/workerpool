@@ -1,6 +1,7 @@
 package workerpool
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"testing"
@@ -41,6 +42,35 @@ func (m *mockTenantProvider) set(tenants []Tenant) {
 	defer m.mu.Unlock()
 
 	m.tenants = tenants
+}
+
+// setErr настраивает ошибку, возвращаемую последующими вызовами List.
+func (m *mockTenantProvider) setErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.err = err
+}
+
+// syncBuffer — потокобезопасная обёртка над bytes.Buffer для перехвата
+// вывода slog-логгера из горутин, работающих конкурентно с тестом.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
 }
 
 // mockExecutor — реализация TaskExecutor с настраиваемым поведением.

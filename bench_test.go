@@ -3,11 +3,11 @@ package workerpool
 import (
 	"fmt"
 	"log/slog"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/goleak"
 )
 
 // TestMain отключает slog.Default() перед бенчмарками: startManager/Stop
@@ -19,7 +19,7 @@ import (
 // только место вывода, не объём работы.
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.DiscardHandler))
-	os.Exit(m.Run())
+	goleak.VerifyTestMain(m)
 }
 
 // BenchmarkSubmitTask измеряет сквозную стоимость одной задачи: SubmitTask +

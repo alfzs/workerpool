@@ -112,6 +112,11 @@ func ExampleNewWorkerManager() {
 		return
 	}
 
-	fmt.Println(<-done)
+	select {
+	case err := <-done:
+		fmt.Println(err)
+	case <-time.After(5 * time.Second):
+		fmt.Println("timed out waiting for task completion")
+	}
 	// Output: <nil>
 }

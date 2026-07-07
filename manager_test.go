@@ -3,6 +3,8 @@ package workerpool
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1089,6 +1091,10 @@ func TestStopDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
+	// Stop уже вызывается вручную ниже, но t.Cleanup — страховка на случай
+	// t.Fatalf между Start и ручным Stop (Stop идемпотентен, см. TestStopIdempotent).
+	t.Cleanup(m.Stop)
+
 	// Запускаем задачи, которые блокируются на ctx.Done().
 	var started sync.WaitGroup
 	started.Add(4)
@@ -1229,5 +1235,282 @@ func TestGetTenantIDs(t *testing.T) {
 		if !idSet[id] {
 			t.Errorf("tenant %s missing from GetTenantIDs", id)
 		}
+	}
+}
+
+// --- Регрессионные тесты для непокрытых ветвей (docs/TESTING_AUDIT.md) ---
+
+// TestStartInitialRefreshFailure проверяет, что Start возвращает ошибку,
+// если начальный refreshTenants не может получить список тенантов, и что
+// пул, запущенный до этой проверки, корректно останавливается, а не
+// остаётся висеть в фоне.
+func TestStartInitialRefreshFailure(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("provider unavailable")
+	provider := &mockTenantProvider{}
+	provider.setErr(wantErr)
+
+	m, err := NewWorkerManager(WorkerManagerParams{TenantProvider: provider, Config: newTestConfig()})
+	if err != nil {
+		t.Fatalf("NewWorkerManager: %v", err)
+	}
+
+	if err := m.Start(); !errors.Is(err, wantErr) {
+		t.Errorf("Start() error = %v, want errors.Is(err, wantErr)", err)
+	}
+
+	// Start должен был остановить уже запущенный пул перед возвратом ошибки:
+	// последующий addTask обязан немедленно вернуть ErrPoolStopping, а не
+	// зависнуть или тихо принять задачу, которую уже некому выполнять.
+	if err := m.pool.addTask(newTask(uuid.New(), successExec(), func(error) {})); !errors.Is(err, ErrPoolStopping) {
+		t.Errorf("pool.addTask after failed Start: err = %v, want errors.Is(err, ErrPoolStopping)", err)
+	}
+}
+
+// TestRefreshTenantsSkipsAfterStop проверяет, что refreshTenants,
+// вызванный после Stop, не воскрешает удалённые/новые тенанты — защита
+// isStopping должна сработать раньше любых изменений w.tenants.
+func TestRefreshTenantsSkipsAfterStop(t *testing.T) {
+	t.Parallel()
+
+	keptID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: keptID, limit: 1}})
+	m := startManager(t, provider, newTestConfig())
+
+	m.Stop()
+
+	newID := uuid.New()
+	provider.set([]Tenant{&mockTenant{id: keptID, limit: 1}, &mockTenant{id: newID, limit: 1}})
+
+	if err := m.refreshTenants(); err != nil {
+		t.Fatalf("refreshTenants after Stop: %v", err)
+	}
+
+	for _, id := range m.GetTenantIDs() {
+		if id == newID {
+			t.Error("refreshTenants added a new tenant after Stop")
+		}
+	}
+}
+
+// TestRefreshTenantsSkipsNilID проверяет, что тенант с нулевым UUID
+// пропускается при построении множества тенантов, а не порождает
+// пустой/некорректный tenantState.
+func TestRefreshTenantsSkipsNilID(t *testing.T) {
+	t.Parallel()
+
+	goodID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{
+		&mockTenant{id: uuid.Nil, limit: 1},
+		&mockTenant{id: goodID, limit: 1},
+	})
+	m := startManager(t, provider, newTestConfig())
+
+	ids := m.GetTenantIDs()
+	if len(ids) != 1 || ids[0] != goodID {
+		t.Errorf("GetTenantIDs = %v, want only [%v] (nil-id tenant must be skipped)", ids, goodID)
+	}
+}
+
+// TestRefreshTenantsDefaultsNonPositiveWorkerLimit проверяет, что тенант с
+// WorkerLimit <= 0 получает лимит по умолчанию (1), а не семафор нулевой
+// ёмкости, который заблокировал бы диспетчер навсегда.
+func TestRefreshTenantsDefaultsNonPositiveWorkerLimit(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 0}})
+	m := startManager(t, provider, newTestConfig())
+
+	done := make(chan error, 1)
+	task := newTask(tenantID, successExec(), func(err error) { done <- err })
+
+	if err := m.SubmitTask(tenantID, task); err != nil {
+		t.Fatalf("SubmitTask: %v", err)
+	}
+
+	err := waitComplete(t, done, 3*time.Second,
+		"task did not complete — non-positive WorkerLimit may not have defaulted to 1")
+	if err != nil {
+		t.Errorf("task error: %v", err)
+	}
+}
+
+// TestTenantRefresherLogsErrorOnListFailure проверяет, что фоновый
+// tenantRefresher логирует ошибку provider.List, а не проглатывает её молча.
+func TestTenantRefresherLogsErrorOnListFailure(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+
+	var buf syncBuffer
+
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	m, err := NewWorkerManager(WorkerManagerParams{
+		TenantProvider: provider,
+		Config:         newTestConfig(),
+		Logger:         logger,
+	})
+	if err != nil {
+		t.Fatalf("NewWorkerManager: %v", err)
+	}
+
+	if err := m.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	t.Cleanup(m.Stop)
+
+	provider.setErr(errors.New("boom"))
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(buf.String(), "tenant refresh failed") {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !strings.Contains(buf.String(), "tenant refresh failed") {
+		t.Error(`expected "tenant refresh failed" to be logged after provider.List started returning an error`)
+	}
+}
+
+// TestSubmitTaskTenantShuttingDown проверяет ветку ErrTenantShuttingDown в
+// SubmitTask: если контекст тенанта отменён, а очередь тенанта заполнена
+// (так что отправка в неё не готова к выполнению), select обязан
+// детерминированно выбрать case <-state.ctx.Done(), а не default.
+func TestSubmitTaskTenantShuttingDown(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 1}})
+
+	cfg := newTestConfig()
+	cfg.TenantQueueSize = 1
+	m := startManager(t, provider, cfg)
+
+	blockRelease := make(chan struct{})
+	defer close(blockRelease)
+
+	blocker := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
+		<-blockRelease
+		return nil
+	}}
+
+	// A: занимает единственный слот семафора (тенант limit=1); диспетчер
+	// зависает в pool.addTask/Execute, ожидая blockRelease.
+	if err := m.SubmitTask(tenantID, newTask(tenantID, blocker, func(error) {})); err != nil {
+		t.Fatalf("submit A: %v", err)
+	}
+
+	time.Sleep(30 * time.Millisecond) // дать диспетчеру подхватить A и вызвать pool.addTask
+
+	// B: диспетчер читает B из очереди и блокируется на sem.Acquire, пока A
+	// удерживает единственный слот — очередь тенанта снова пуста.
+	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(error) {})); err != nil {
+		t.Fatalf("submit B: %v", err)
+	}
+
+	time.Sleep(30 * time.Millisecond) // дать диспетчеру вычитать B и заблокироваться на sem.Acquire
+
+	// C: заполняет единственный слот буфера очереди тенанта (cap=1).
+	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(error) {})); err != nil {
+		t.Fatalf("submit C: %v", err)
+	}
+
+	// Отменяем контекст именно этого тенанта напрямую (white-box: тот же
+	// пакет), не трогая остальной WorkerManager — так же, как это делает
+	// refreshTenants при удалении тенанта.
+	m.tenantsMu.RLock()
+	state := m.tenants[tenantID]
+	m.tenantsMu.RUnlock()
+
+	if state == nil {
+		t.Fatal("tenant state not found")
+	}
+
+	state.cancel()
+
+	err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(error) {}))
+	if !errors.Is(err, ErrTenantShuttingDown) {
+		t.Errorf("SubmitTask after tenant ctx cancelled: err = %v, want errors.Is(err, ErrTenantShuttingDown)", err)
+	}
+}
+
+// TestDispatchWarnsOnPoolRejectionWithNoCompletionHandler проверяет ветку
+// dispatch, где пул отклоняет задачу (переполнение taskChan) и у задачи нет
+// Complete-обработчика: диспетчер обязан залогировать предупреждение, а не
+// потерять ошибку молча.
+func TestDispatchWarnsOnPoolRejectionWithNoCompletionHandler(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	provider := &mockTenantProvider{}
+	provider.set([]Tenant{&mockTenant{id: tenantID, limit: 3}})
+
+	var buf syncBuffer
+
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	cfg := newTestConfig()
+	cfg.TaskQueueSize = 1
+	cfg.WorkerCount = 1
+
+	m, err := NewWorkerManager(WorkerManagerParams{TenantProvider: provider, Config: cfg, Logger: logger})
+	if err != nil {
+		t.Fatalf("NewWorkerManager: %v", err)
+	}
+
+	if err := m.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	t.Cleanup(m.Stop)
+
+	blockRelease := make(chan struct{})
+	defer close(blockRelease)
+
+	blocker := &mockExecutor{fn: func(_ context.Context, _ uuid.UUID, _ int) error {
+		<-blockRelease
+		return nil
+	}}
+
+	// Занимает единственного воркера пула — taskChan (cap=1) освобождается
+	// сразу после того, как воркер его вычитает.
+	if err := m.SubmitTask(tenantID, newTask(tenantID, blocker, func(error) {})); err != nil {
+		t.Fatalf("submit blocker: %v", err)
+	}
+
+	time.Sleep(30 * time.Millisecond) // дать единственному воркеру вычитать blocker из taskChan
+
+	// Заполняет единственный слот буфера taskChan пула.
+	if err := m.SubmitTask(tenantID, newTask(tenantID, successExec(), func(error) {})); err != nil {
+		t.Fatalf("submit filler: %v", err)
+	}
+
+	time.Sleep(30 * time.Millisecond) // дать диспетчеру протолкнуть filler в очередь пула
+
+	// Задача без Complete — именно она должна вызвать addTask на полной
+	// очереди пула и попасть в ветку original == nil.
+	noCompleteTask := newTask(tenantID, successExec(), nil)
+	if err := m.SubmitTask(tenantID, noCompleteTask); err != nil {
+		t.Fatalf("submit no-complete task: %v", err)
+	}
+
+	const wantLog = "pool rejected task with no completion handler"
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(buf.String(), wantLog) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !strings.Contains(buf.String(), wantLog) {
+		t.Errorf("expected %q to be logged", wantLog)
 	}
 }

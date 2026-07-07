@@ -1,6 +1,7 @@
 package workerpool
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -40,8 +41,8 @@ func TestExecutorRegistry_Register(t *testing.T) {
 		t.Parallel()
 
 		r := NewExecutorRegistry()
-		if err := r.Register("", successExec()); err == nil {
-			t.Error("expected error for empty key")
+		if err := r.Register("", successExec()); !errors.Is(err, ErrEmptyExecutorKey) {
+			t.Errorf("Register(\"\", ...) error = %v, want errors.Is(err, ErrEmptyExecutorKey)", err)
 		}
 	})
 
@@ -49,8 +50,8 @@ func TestExecutorRegistry_Register(t *testing.T) {
 		t.Parallel()
 
 		r := NewExecutorRegistry()
-		if err := r.Register("key", nil); err == nil {
-			t.Error("expected error for nil executor")
+		if err := r.Register("key", nil); !errors.Is(err, ErrNilExecutor) {
+			t.Errorf("Register(\"key\", nil) error = %v, want errors.Is(err, ErrNilExecutor)", err)
 		}
 	})
 
@@ -60,8 +61,8 @@ func TestExecutorRegistry_Register(t *testing.T) {
 		r := NewExecutorRegistry()
 
 		_ = r.Register("key", successExec())
-		if err := r.Register("key", successExec()); err == nil {
-			t.Error("expected error for duplicate key")
+		if err := r.Register("key", successExec()); !errors.Is(err, ErrExecutorAlreadyRegistered) {
+			t.Errorf("duplicate Register error = %v, want errors.Is(err, ErrExecutorAlreadyRegistered)", err)
 		}
 	})
 }
@@ -90,8 +91,8 @@ func TestExecutorRegistry_Get(t *testing.T) {
 		t.Parallel()
 
 		r := NewExecutorRegistry()
-		if _, err := r.Get("missing"); err == nil {
-			t.Error("expected error for missing key")
+		if _, err := r.Get("missing"); !errors.Is(err, ErrExecutorNotFound) {
+			t.Errorf("Get(\"missing\") error = %v, want errors.Is(err, ErrExecutorNotFound)", err)
 		}
 	})
 }
