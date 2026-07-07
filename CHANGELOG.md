@@ -11,16 +11,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.1.5] - 2026-07-07
+
+A documentation and hardening release: a series of skill-driven audits
+(safety, security, structs & interfaces, concurrency, context, data
+structures, dependency injection, design patterns, modernization,
+benchmarking, observability, performance, pkg.go.dev, project layout,
+testing) surfaced and fixed several concurrency and correctness issues, and
+raised test coverage from 89.0% to 93.8%. No breaking changes.
+
 ### Added
 
-- `docs/CODE_STYLE_AUDIT.md`, README, CONTRIBUTING, LICENSE (MIT), llms.txt.
+- `docs/CODE_STYLE_AUDIT.md` and thirteen further audit documents (safety,
+  security, structs & interfaces, concurrency, context, data structures,
+  dependency injection, design patterns, modernization, benchmark,
+  observability, performance, pkg.go.dev, project layout, testing), README,
+  CONTRIBUTING, LICENSE (MIT), llms.txt.
 - `ExampleXxx` test functions for `ExecutorRegistry` and `WorkerManager`.
+- Baseline benchmarks for `SubmitTask`, `ExecutorRegistry.Get`,
+  `refreshTenants`, and `exponentialBackoff`.
+- `go.uber.org/goleak` wired into `TestMain` to catch leaked goroutines.
+- Nine regression tests closing every branch `go tool cover` reported at 0%.
+- `Makefile` and extended `.gitignore` for repo hygiene.
 
 ### Fixed
 
+- Held `tenantsMu` across `SubmitTask`'s send to close a race with tenant
+  removal.
+- Made `setWorkerCount` wait for the previous dispatcher generation to exit
+  before starting a new one, closing a generation-handoff race.
+- Drained a tenant's task queue on removal to guarantee `Task.Complete` is
+  always called.
+- Added interface assertions and JSON tags to `HealthStatus`.
+- Injected the logger via `WorkerManagerParams` instead of reading
+  `slog.Default()` at call time.
+- Propagated task span context into `recordCompletion` metrics and threaded
+  `context.Context` into internal `slog` calls for trace correlation.
+- Applied `Config.TaskTimeout` as the actual task execution deadline (it was
+  previously accepted but unused).
+- Resolved findings from the golang-safety, error-handling/lint/naming, and
+  golang-code-style audits.
 - Removed a redundant `else` after a `return` in `pool.executeWithRetry`.
-- Reordered `WorkerManager.dispatch` parameters so `context.Context` comes first.
-- Replaced an index-based counting loop with `range` in `exponentialBackoff`.
+- Reordered `WorkerManager.dispatch` parameters so `context.Context` comes
+  first.
+- Replaced an index-based counting loop with `range` in
+  `exponentialBackoff`.
+
+### Changed
+
+- Default logger construction in `NewWorkerManager` now uses `cmp.Or`.
 
 ## [2.1.4] - 2026-06-28
 
@@ -71,7 +110,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial v2 release.
 
-[Unreleased]: https://github.com/alfzs/workerpool/compare/v2.1.4...HEAD
+[Unreleased]: https://github.com/alfzs/workerpool/compare/v2.1.5...HEAD
+[2.1.5]: https://github.com/alfzs/workerpool/releases/tag/v2.1.5
 [2.1.4]: https://github.com/alfzs/workerpool/releases/tag/v2.1.4
 [2.1.3]: https://github.com/alfzs/workerpool/releases/tag/v2.1.3
 [2.1.2]: https://github.com/alfzs/workerpool/releases/tag/v2.1.2
